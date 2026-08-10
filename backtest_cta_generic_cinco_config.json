@@ -1,4 +1,36 @@
 {
+    "_comment": {
+        "purpose": "本文件是 vnpy 通用回测脚手架 backtest_generic.py 的配置文件。运行方式：python backtest_generic.py backtest_cta_generic_cinco_config.json。它会读取本 JSON、加载下面的策略模块，对港股腾讯控股(0700.HK)做1分钟K线回测。重要说明：JSON 标准不支持 '#' 注释，因此本文件把所有字段的说明统一集中放在顶层 _comment 字段里。加载器只读取 mode/name/engine/strategy 四个键，多余的 _comment 会被自动忽略，不影响运行。",
+        "mode": "回测模式：cta=单合约回测；若改成 portfolio 则为多合约组合回测。",
+        "name": "本次回测的名称，仅用于日志和图表标题展示，随便改。",
+        "engine": "回测引擎参数：数据源、回测区间、初始资金、交易成本等。",
+        "engine.vt_symbol": "回测合约代码，格式为 合约代码.市场代码。700-HKD-STK.SEHK 表示港股腾讯控股(代码0700，币种HKD，市场SEHK=香港交易所)。",
+        "engine.interval": "K线周期：m=1分钟线。本策略需要喂1分钟数据，由策略内部自动合成15分钟bar再做信号计算。",
+        "engine.start": "回测起始日期（含当天），格式 YYYY-MM-DD。",
+        "engine.end": "回测结束日期（含当天），格式 YYYY-MM-DD；省略则回测到数据文件末尾。",
+        "engine.capital": "初始资金（货币单位），即回测开始时账户里的钱。",
+        "engine.rate": "单边交易费率（小数）。0.0013 = 0.13%。注意：当 commission_model=ib 时，IB 股票（美股/港股）改用固定式佣金，本费率对它们不再生效。",
+        "engine.slippage": "滑点（价格单位）。模拟真实成交价与信号价之间的偏差，港股按 0.01（即1个最小跳动）保守估算。",
+        "engine.size": "合约乘数。股票为 1，即价格就是每股价格，盈亏 = 股数 × 价差。",
+        "engine.pricetick": "最小价格跳动（tick size）。港股常用 0.01，即报价最小变动0.01元。",
+        "strategy": "策略段：指定要加载哪个策略文件、哪个类、以及传给策略的参数。",
+        "strategy.module": "策略模块路径，可以是点分模块名或 .py 文件路径。本配置用绝对路径指向 C:/Users/sandytaoli/strategies/cta_generic_cinco_strategy.py。",
+        "strategy.class": "策略类名，必须与策略文件里定义的类名完全一致：CtaGenericCincoStrategy。",
+        "strategy.extra_paths": "额外加入 Python 搜索路径(sys.path)的目录列表。加载策略模块时若找不到文件，会先在这些目录里找。",
+        "strategy.params": "传给策略构造函数的参数字典。vnpy 会把其中每个键自动设置成策略的实例属性，策略代码里用 self.键名 读取。",
+        "strategy.params.json_path": "通达信公式所在目录。本策略是'公式驱动'型，运行每根bar时会调用公式引擎读取这里的公式文件。",
+        "strategy.params.formula_name": "使用的公式名（即 .tdx 公式文件名去掉扩展名）：布林带移动止损系统。布林带三轨、移动止损价、开平仓信号全部写在这个公式里。",
+        "strategy.params.formula_params": "覆盖公式默认参数的 JSON 字符串：BOLLW=布林带周期42，BOLLD=标准差倍数2.2，TRAIL_LONG=多单移动止损倍数0.65，TRAIL_SHORT=空单移动止损倍数0.65。",
+        "strategy.params.min_bars": "指标预热最少K线数。策略启动后前200根bar只累计数据不出信号，让 MA/STD 等指标先稳定下来。",
+        "strategy.params.max_bars": "策略内部K线缓存上限（环形缓冲）。超过后自动丢弃最旧数据，防止内存无限增长。",
+        "strategy.params.trailing_long": "多单移动止损倍数，仅供 GUI 界面展示。实际交易以 formula_params 里的 TRAIL_LONG 为准（两者默认值一致，均为0.65）。",
+        "strategy.params.trailing_short": "空单移动止损倍数，仅供 GUI 界面展示。实际交易以 formula_params 里的 TRAIL_SHORT 为准。",
+        "strategy.params.atr_window": "平均真实波幅(ATR)的周期（4根bar）。用于波动率定仓：波动越大，单手下得越小。",
+        "strategy.params.risk_level": "风险预算（货币单位）。定仓公式：下单量 = int(risk_level / ATR(atr_window))，再向下取整到 min_volume 的整数倍（至少1手）。",
+        "strategy.params.min_volume": "最小下单量/整手股数。港股腾讯0700每手100股，下单量自动对齐到100的整数倍（至少1手）；美股无手数概念填1，即任意整数股。",
+        "commission_model": "佣金模型：ib=IB固定式佣金补丁（美股每股$0.005最低$1；港股成交额0.08%并折算回HKD），此时 engine.rate 对 IB 股票不再生效；vnpy=按 engine.rate 比例费率。"
+    },
+    "commission_model": "ib",
     "mode": "cta",
     "name": "CTA 示例：Cinco 公式驱动（布林带移动止损 + 停止单，腾讯控股 1 分钟）",
     "engine": {
@@ -27,7 +59,8 @@
             "trailing_long": 0.65,
             "trailing_short": 0.65,
             "atr_window": 4,
-            "risk_level": 300
+            "risk_level": 300,
+            "min_volume": 100
         }
     }
 }
