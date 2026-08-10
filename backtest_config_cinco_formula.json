@@ -1,0 +1,33 @@
+{
+    "mode": "cta",
+    "name": "CTA 示例：Cinco 公式驱动（布林带移动止损 + 停止单，腾讯控股 1 分钟）",
+    "engine": {
+        "vt_symbol": "700-HKD-STK.SEHK",
+        "interval": "m",
+        "start": "2024-01-01",
+        "end": "2026-08-08",
+        "capital": 1000000,
+        "rate": 0.0013,
+        "slippage": 0.01,
+        "size": 1,
+        "pricetick": 0.01
+    },
+    "strategy": {
+        "module": "C:/Users/sandytaoli/strategies/cta_generic_cinco_strategy.py",
+        "class": "CtaGenericCincoStrategy",
+        "extra_paths": [
+            "C:/Users/sandytaoli/strategies"
+        ],
+        "params": {
+            "json_path": "g:\\vnpy-4.4.0\\examples\\tdx_formula\\formulas",
+            "formula_name": "布林带移动止损系统",
+            "formula_params": "{\"BOLLW\": 42, \"BOLLD\": 2.2, \"TRAIL_LONG\": 0.65, \"TRAIL_SHORT\": 0.65}",
+            "min_bars": 200,
+            "max_bars": 2000,
+            "trailing_long": 0.65,
+            "trailing_short": 0.65,
+            "atr_window": 4,
+            "risk_level": 300
+        }
+    }
+}
