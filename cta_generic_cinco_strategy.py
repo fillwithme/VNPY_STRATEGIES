@@ -15,7 +15,7 @@ cta_generic_cinco_strategy.py - 通达信公式驱动 + 停止单 CTA 策略（v
     UPPER / LOWER   -> 无持仓: buy(UPPER) + short(LOWER) 双挂停止单
     LONGSTOP        -> 持多:   sell(LONGSTOP) 停止单（移动止损）
     SHORTSTOP       -> 持空:   cover(SHORTSTOP) 停止单（移动止损）
-    波动率定仓: trading_size = int(risk_level / ATR(atr_window))，并按 min_volume 整手对齐
+    波动率定仓: trading_size = int(risk_level / ATR(atr_window))，并按 lot_size 整手对齐（不足一手归零不下单）
 
 【已知偏差】
 持仓期价格再次突破上/下轨时 BARSLAST 收缩 -> HHVD/LLVD 窗口变小 ->
@@ -172,7 +172,7 @@ class CtaGenericCincoStrategy(CtaTemplate):
     trailing_short = 0.65                      # 空单移动止损倍数（GUI 展示用）
     atr_window = 4                             # 波动率定仓用的 ATR 周期
     risk_level = 300                           # 风险预算（单笔冒的风险金额）
-    min_volume = 1                             # 最小下单量/整手股数（港股腾讯0700=100；美股无手数概念填1）
+    lot_size = 1                               # 每手股数（港股腾讯0700=100；美股无手数概念填1）
 
     # ========================================================================
     # 3.2 策略变量（variables 列表中的项，GUI 界面实时显示）
@@ -180,7 +180,7 @@ class CtaGenericCincoStrategy(CtaTemplate):
     # 定義變數
     boll_up = 0        # 布林带上轨（公式输出，最新一根 bar 的值）
     boll_down = 0      # 布林带下轨（公式输出，最新一根 bar 的值）
-    trading_size = 0   # 本次下单股数（已按 min_volume 整手对齐）
+    trading_size = 0   # 本次下单股数（已按 lot_size 整手对齐，不足一手为 0 不下单）
     long_stop = 0      # 多单移动止损价（公式输出）
     short_stop = 0     # 空单移动止损价（公式输出）
     atr_value = 0      # 最新 ATR 值（用于定仓）
@@ -196,14 +196,14 @@ class CtaGenericCincoStrategy(CtaTemplate):
         "trailing_short",   # 空单止损倍数（展示用）
         "atr_window",       # ATR 周期
         "risk_level",       # 风险预算
-        "min_volume"        # 最小下单量（整手对齐）
+        "lot_size"          # 每手股数（整手对齐）
     ]
 
     # ---- 可在 GUI 中实时查看的变量白名单 ----
     variables = [
         "boll_up",       # 布林带上轨
         "boll_down",     # 布林带下轨
-        "trading_size",  # 本次下单股数（已按 min_volume 整手对齐）
+        "trading_size",  # 本次下单股数（已按 lot_size 整手对齐）
         "long_stop",     # 多单止损价
         "short_stop",    # 空单止损价
         "atr_value"      # ATR 值
@@ -364,9 +364,13 @@ class CtaGenericCincoStrategy(CtaTemplate):
             self.atr_value = self.am.atr(self.atr_window)  # 计算 ATR（波动率）
             # 波动率定仓：风险预算 / 当前波动率 = 期望股数
             raw_size = int(self.risk_level / self.atr_value)
-            # 整手对齐：min_volume>1 时向下取整到其整数倍（至少 1 手）
-            lot = max(int(self.min_volume), 1)
-            self.trading_size = max(raw_size // lot, 1) * lot
+            # 整手对齐：按下单量/lot_size 向下取整到其整数倍，不足一手归零不下单（与海龟一致）
+            lot = max(int(self.lot_size), 1)
+            self.trading_size = int(raw_size / lot) * lot
+
+            # 不足一手不下单，跳过本次双挂停止单
+            if not self.trading_size:
+                return
 
             # 挂多单停止单：价格向上突破上轨则买入（stop=True 表示停止单）
             self.buy(self.boll_up, self.trading_size, stop=True)
