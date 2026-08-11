@@ -19,18 +19,129 @@ turtle_us_hk_strategy.py - 美股/港股通用海龟组合策略
    超价用 get_pricetick()。
 """
 
+import json
+import sys
+from collections import deque
 from datetime import datetime, time
+from pathlib import Path
 from typing import Dict, List
+
+import pandas as pd
 
 from vnpy.trader.constant import Interval
 from vnpy.trader.object import BarData, TickData
 
 from vnpy_portfoliostrategy import (
-    ArrayManager,
     StrategyEngine,
     StrategyTemplate,
 )
 from vnpy_portfoliostrategy.utility import PortfolioBarGenerator
+
+
+# ----------------------------------------------------------------------
+# 工具函数：定位并导入 tdx_engine（与本策略文件解耦，便于随目录迁移）
+# ----------------------------------------------------------------------
+def _import_tdx_engine(extra_hints: list[str] | None = None):
+    """按优先级定位 tdx_engine 模块并返回 TdxEngine 类
+
+    查找顺序：
+        1. 当前 Python 环境（若 examples/tdx_formula 已被加入 sys.path）
+        2. 向上遍历目录，定位 <项目根>/examples/tdx_formula
+        3. extra_hints 提示路径（如公式目录所在目录，跨盘放置时兜底）
+    """
+    try:
+        from tdx_engine import TdxEngine
+        return TdxEngine
+    except ImportError:
+        pass
+
+    here = Path(__file__).resolve().parent
+    for parent in here.parents:
+        pkg_dir = parent / "examples" / "tdx_formula"
+        if pkg_dir.exists() and (pkg_dir / "tdx_engine.py").exists():
+            sys.path.insert(0, str(pkg_dir))
+            from tdx_engine import TdxEngine
+            return TdxEngine
+
+    for hint in (extra_hints or []):
+        hp = Path(hint)
+        if (hp / "tdx_engine.py").exists():
+            sys.path.insert(0, str(hp))
+            from tdx_engine import TdxEngine
+            return TdxEngine
+
+    raise ImportError(
+        "无法定位 tdx_engine.py，请将 examples/tdx_formula 加入 sys.path，"
+        "或把本策略文件与 tdx_engine.py 放在同一目录。"
+    )
+
+
+def _resolve_formula_path(raw: str) -> str:
+    """把 json_path 参数归一化为绝对路径
+
+    - 绝对路径 / ~ 家目录：直接规范化
+    - 相对路径：依次尝试「当前工作目录 / 本策略文件目录及各级父目录
+      （直至项目根）」为基准，因此无论从哪个常见目录填相对路径都能命中
+    - 全部未命中时回退为「cwd/raw」的绝对形式（由 TdxEngine 抛错提示）
+    """
+    if not raw:
+        raise ValueError("json_path 不能为空")
+
+    p = Path(raw).expanduser()
+    if p.is_absolute():
+        return str(p)
+
+    here = Path(__file__).resolve().parent
+    candidates = [Path.cwd()]
+    for base in [here, *here.parents]:
+        candidates.append(base)
+        # 已找到项目根（含 examples/tdx_formula 的目录），无需继续向上
+        if (base / "examples" / "tdx_formula").exists():
+            break
+
+    # 去重后按序尝试（cwd 优先，其次策略文件所在目录逐级向上）
+    seen: set[Path] = set()
+    for base in candidates:
+        if base in seen:
+            continue
+        seen.add(base)
+        cand = base / raw
+        if cand.exists():
+            return str(cand.resolve())
+
+    return str((Path.cwd() / raw).resolve())
+
+
+class _TurtleBarBuffer:
+    """单标的日K OHLCV 环形缓冲（供通达信公式逐日重算指标）"""
+
+    def __init__(self, max_bars: int):
+        self.opens = deque(maxlen=max_bars)
+        self.highs = deque(maxlen=max_bars)
+        self.lows = deque(maxlen=max_bars)
+        self.closes = deque(maxlen=max_bars)
+        self.volumes = deque(maxlen=max_bars)
+
+    def push(self, bar) -> None:
+        """追加一根日K"""
+        self.opens.append(bar.open_price)
+        self.highs.append(bar.high_price)
+        self.lows.append(bar.low_price)
+        self.closes.append(bar.close_price)
+        self.volumes.append(bar.volume)
+
+    def __len__(self) -> int:
+        return len(self.closes)
+
+    def to_df(self) -> pd.DataFrame:
+        """转换为 TdxEngine 期望的 OHLCV DataFrame"""
+        return pd.DataFrame({
+            "open": list(self.opens),
+            "high": list(self.highs),
+            "low": list(self.lows),
+            "close": list(self.closes),
+            "volume": list(self.volumes),
+        })
 
 
 class TurtleUsHkStrategy(StrategyTemplate):
@@ -52,6 +163,11 @@ class TurtleUsHkStrategy(StrategyTemplate):
     lot_sizes: dict = {}            # vt_symbol -> 每手股数（港股如 {"700-HKD-STK.SEHK": 100}，缺省按 1）
     capital: int = 10_000_000       # 风险预算基准资金
     risk_level: float = 0.002       # 单笔风险比例
+    json_path: str = "G:/vnpy-4.4.0/examples/tdx_formula/formulas"  # 通达信公式目录
+    formula_name: str = "海龟交易系统"   # 公式名（.tdx 文件名）
+    formula_params: str = ""             # 公式参数覆盖，JSON 串（空=用策略参数自动映射）
+    max_bars: int = 250                  # 日K缓存上限
+    min_bars: int = 100                  # 预热根数（与原版 ArrayManager size=100 一致）
 
     # 名称列表
     parameters = [
@@ -67,7 +183,12 @@ class TurtleUsHkStrategy(StrategyTemplate):
         "allow_short",
         "lot_sizes",
         "capital",
-        "risk_level"
+        "risk_level",
+        "json_path",
+        "formula_name",
+        "formula_params",
+        "max_bars",
+        "min_bars"
     ]
     variables = []
 
@@ -83,6 +204,21 @@ class TurtleUsHkStrategy(StrategyTemplate):
 
         # 解析日K合成收盘时间
         self.daily_end_time: time = datetime.strptime(self.daily_end, "%H:%M").time()
+
+        # 加载通达信海龟公式（日K指标层）
+        formula_dir = Path(_resolve_formula_path(self.json_path))
+        TdxEngine = _import_tdx_engine([str(formula_dir.parent)])
+        self.formula = TdxEngine(str(formula_dir)).get(self.formula_name)
+
+        # 策略参数 -> 公式参数 自动映射（改策略参数无需手动同步公式）
+        formula_params_dict = {
+            "ENTRY": self.entry_window,
+            "EXIT": self.exit_window,
+            "NPERIOD": self.n_window,
+            "CCIPERIOD": self.cci_window,
+            "CCISIG": self.cci_signal,
+        }
+        formula_params_dict.update(json.loads(self.formula_params) if self.formula_params else {})
 
         # 初始化信号字典
         self.signals: Dict[str, TurtleSignal] = {}
@@ -105,7 +241,11 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 lot_size,
                 self.capital,
                 self.risk_level,
-                self.allow_short
+                self.allow_short,
+                self.formula,
+                formula_params_dict,
+                self.max_bars,
+                self.min_bars
             )
 
         # 初始化目标字典
@@ -227,7 +367,11 @@ class TurtleSignal:
         lot_size: int,
         capital: int,
         risk_level: float,
-        allow_short: bool
+        allow_short: bool,
+        formula=None,
+        formula_params: dict = None,
+        max_bars: int = 250,
+        min_bars: int = 100
     ) -> None:
         """构造函数"""
         # 参数
@@ -259,7 +403,11 @@ class TurtleSignal:
             trading_size=self.trading_size,
             contract_size=self.contract_size,
             unit_limit=self.unit_limit,
-            allow_short=self.allow_short
+            allow_short=self.allow_short,
+            formula=formula,
+            formula_params=formula_params,
+            max_bars=max_bars,
+            min_bars=min_bars
         )
 
     def on_bar(self, bar: BarData) -> None:
@@ -307,7 +455,11 @@ class TurtleFactor:
         trading_size: int,
         contract_size: int,
         unit_limit: int,
-        allow_short: bool
+        allow_short: bool,
+        formula=None,
+        formula_params: dict = None,
+        max_bars: int = 250,
+        min_bars: int = 100
     ) -> None:
         """构造函数"""
         # 参数
@@ -337,14 +489,18 @@ class TurtleFactor:
 
         self.target: int = 0             # 目标仓位
         self.traded: bool = False        # 日内交易过
+        self.inited: bool = False        # 日K指标预热完成
 
-        # 工具
-        self.am = ArrayManager()
+        # 工具：通达信公式 + 日K环形缓冲
+        self.formula = formula
+        self.formula_params = formula_params or {}
+        self.buf = _TurtleBarBuffer(max_bars)
+        self.min_bars = min_bars
 
     def on_bar(self, bar: BarData) -> None:
         """原始K线推送"""
         # 每日只允许交易一次
-        if self.am.inited and not self.traded:
+        if self.inited and not self.traded:
             old_target: int = self.target
 
             # 判断当前目标
@@ -377,20 +533,30 @@ class TurtleFactor:
                 self.traded = True
 
     def update_daily_bar(self, bar: BarData) -> None:
-        """日K线推送（由策略层 on_daily_bars 按品种分发）"""
+        """日K线推送（由策略层 on_daily_bars 按品种分发）
+
+        指标层改用通达信海龟公式（TdxEngine）计算：
+        缓存日K -> 运行公式 -> 读取 ENTRYUP/ENTRYDOWN/NVAL/EXITUP/EXITDOWN/CCIVAL。
+        冻结语义（无持仓时才更新入场通道与N值）与原版 ArrayManager 版本完全一致。
+        """
         # 缓存K线序列
-        self.am.update_bar(bar)
-        if not self.am.inited:
+        self.buf.push(bar)
+        if len(self.buf) < self.min_bars:
             return
+        self.inited = True
+
+        out = self.formula.run(self.buf.to_df(), **self.formula_params)
 
         # 只有无持仓时，才更新入场通道位置和波动度量
         if not self.target:
-            self.entry_up, self.entry_down = self.am.donchian(self.entry_window)
-            self.n = self.am.atr(self.n_window)
+            self.entry_up = float(out["ENTRYUP"].iloc[-1])
+            self.entry_down = float(out["ENTRYDOWN"].iloc[-1])
+            self.n = float(out["NVAL"].iloc[-1])
 
-        self.exit_up, self.exit_down = self.am.donchian(self.exit_window)
+        self.exit_up = float(out["EXITUP"].iloc[-1])
+        self.exit_down = float(out["EXITDOWN"].iloc[-1])
 
-        self.cci = self.am.cci(self.cci_window)
+        self.cci = float(out["CCIVAL"].iloc[-1])
 
         # 新的一天清空交易记录
         self.traded = False

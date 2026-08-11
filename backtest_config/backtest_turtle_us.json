@@ -38,7 +38,11 @@
                 "JPM-USD-STK.SMART": 1
             },
             "capital": 1000000,
-            "risk_level": 0.002
+            "risk_level": 0.002,
+            "json_path": "G:/vnpy-4.4.0/examples/tdx_formula/formulas",
+            "formula_name": "海龟交易系统",
+            "max_bars": 250,
+            "min_bars": 100
         }
     }
 }
