@@ -1,0 +1,44 @@
+{
+    "mode": "portfolio",
+    "commission_model": "ib",
+    "name": "港股海龟组合回测（turtle_us_hk_strategy, 分钟K）",
+    "engine": {
+        "vt_symbols": [
+            "700-HKD-STK.SEHK",
+            "9988-HKD-STK.SEHK",
+            "3690-HKD-STK.SEHK",
+            "1810-HKD-STK.SEHK",
+            "1299-HKD-STK.SEHK",
+            "388-HKD-STK.SEHK"
+        ],
+        "interval": "m",
+        "start": "2020-01-01",
+        "end": "2026-08-08",
+        "capital": 1000000,
+        "rates": 0.0013,
+        "slippages": 0.01,
+        "sizes": 1,
+        "priceticks": 0.01
+    },
+    "strategy": {
+        "module": "turtle_us_hk_strategy",
+        "class": "TurtleUsHkStrategy",
+        "extra_paths": [
+            "C:\\Users\\sandytaoli\\strategies"
+        ],
+        "params": {
+            "daily_end": "15:59",
+            "allow_short": true,
+            "lot_sizes": {
+                "700-HKD-STK.SEHK": 100,
+                "9988-HKD-STK.SEHK": 100,
+                "3690-HKD-STK.SEHK": 100,
+                "1810-HKD-STK.SEHK": 200,
+                "1299-HKD-STK.SEHK": 200,
+                "388-HKD-STK.SEHK": 100
+            },
+            "capital": 1000000,
+            "risk_level": 0.002
+        }
+    }
+}

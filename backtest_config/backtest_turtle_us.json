@@ -1,0 +1,44 @@
+{
+    "mode": "portfolio",
+    "commission_model": "ib",
+    "name": "美股海龟组合回测（turtle_us_hk_strategy, 分钟K）",
+    "engine": {
+        "vt_symbols": [
+            "AAPL-USD-STK.SMART",
+            "MSFT-USD-STK.SMART",
+            "NVDA-USD-STK.SMART",
+            "TSLA-USD-STK.SMART",
+            "AMZN-USD-STK.SMART",
+            "JPM-USD-STK.SMART"
+        ],
+        "interval": "m",
+        "start": "2020-01-01",
+        "end": "2026-08-08",
+        "capital": 1000000,
+        "rates": 0.0005,
+        "slippages": 0.01,
+        "sizes": 1,
+        "priceticks": 0.01
+    },
+    "strategy": {
+        "module": "turtle_us_hk_strategy",
+        "class": "TurtleUsHkStrategy",
+        "extra_paths": [
+            "C:\\Users\\sandytaoli\\strategies"
+        ],
+        "params": {
+            "daily_end": "15:59",
+            "allow_short": true,
+            "lot_sizes": {
+                "AAPL-USD-STK.SMART": 1,
+                "MSFT-USD-STK.SMART": 1,
+                "NVDA-USD-STK.SMART": 1,
+                "TSLA-USD-STK.SMART": 1,
+                "AMZN-USD-STK.SMART": 1,
+                "JPM-USD-STK.SMART": 1
+            },
+            "capital": 1000000,
+            "risk_level": 0.002
+        }
+    }
+}
