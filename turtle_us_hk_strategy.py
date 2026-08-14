@@ -127,7 +127,8 @@ class TurtleUsHkStrategy(StrategyTemplate):
     allow_short: bool = True        # 是否允许做空
     lot_sizes: dict = {}            # vt_symbol -> 每手股数（港股如 {"700-HKD-STK.SEHK": 100}，缺省按 1）
     capital: int = 10_000_000       # 风险预算基准资金
-    risk_level: float = 0.002       # 单笔风险比例
+    risk_level: float = 0.002       # 单笔风险比例（默认，未在 risk_levels 配置的标的回退到此值）
+    risk_levels: dict = {}          # vt_symbol -> 单笔风险比例（按标的风格分档，趋势/成长股 0.004、低波动价值股 0.001）
     json_path: str = "G:/vnpy-4.4.0/examples/tdx_formula/formulas"  # 通达信公式目录
     formula_name: str = "海龟交易系统"   # 公式名（.tdx 文件名）
     formula_params: str = ""             # 公式参数覆盖，JSON 串（空=用策略参数自动映射）
@@ -149,6 +150,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
         "lot_sizes",
         "capital",
         "risk_level",
+        "risk_levels",
         "json_path",
         "formula_name",
         "formula_params",
@@ -209,7 +211,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 contract_size,
                 lot_size,
                 self.capital,
-                self.risk_level,
+                self.risk_levels.get(vt_symbol, self.risk_level),
                 machine
             )
 
