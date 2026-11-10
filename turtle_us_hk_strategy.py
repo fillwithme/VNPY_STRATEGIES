@@ -139,9 +139,12 @@ turtle_us_hk_strategy.py - 美股/港股通用海龟组合策略
 
 import json
 import sys
-from datetime import datetime, time
+from collections import deque
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Dict, List
+
+import numpy as np
 
 from vnpy.trader.constant import Interval
 from vnpy.trader.object import BarData, TickData
@@ -254,6 +257,29 @@ class TurtleUsHkStrategy(StrategyTemplate):
     max_bars: int = 250                  # 日K缓存上限
     min_bars: int = 100                  # 预热根数（与原版 ArrayManager size=100 一致）
 
+    # ---- 组合层风控参数（默认全部不启用，保证基线配置可逐字复现）----
+    # P0-1 组合总敞口与单标权重
+    max_gross_exposure: float = 0.0      # 总敞口上限 = Σ|持仓市值| / capital；0=不启用
+    max_symbol_weight: float = 0.0       # 单标市值上限 = |单标的市值| / capital；0=不启用
+    # P0-2 两级回撤熔断
+    dd_level1: float = 0.0               # 一级回撤阈值（相对权益峰值，0.20=20%）；0=不启用
+    dd_level1_scale: float = 0.5         # 一级回撤触发后，新开仓缩放系数
+    dd_level2: float = 0.0               # 二级回撤阈值；0=不启用
+    dd_level2_pause_days: int = 10       # 二级回撤触发后，暂停开新仓的交易日数
+    # P1-1 波动率目标化
+    vol_target: float = 0.0              # 目标年化波动率（0.15=15%）；0=不启用
+    vol_lookback: int = 20               # 已实现波动率回看交易日数
+    vol_scale_min: float = 0.3           # 波动率缩放系数下限
+    vol_scale_max: float = 1.5           # 波动率缩放系数上限
+    # P1-3 自适应选股：市场广度决定同时持仓数量上限（默认不启用）
+    use_trend_filter: bool = False       # 是否启用「均线趋势过滤 + 动态持仓数量」
+    trend_window: int = 60               # 趋势均线周期（日线，如 MA60）
+    max_pos_strong: int = 10             # 广度强时最多同时持仓数（不超过股票池）
+    max_pos_normal: int = 5              # 广度一般时最多持仓数
+    max_pos_weak: int = 2                # 广度弱时最多持仓数
+    breadth_strong: float = 0.7          # 广度 >= 该比例视为强（如 70% 标的在均线上）
+    breadth_weak: float = 0.4            # 广度 < 该比例视为弱（如 40%）
+
     # 名称列表
     parameters = [
         "entry_window",
@@ -274,7 +300,26 @@ class TurtleUsHkStrategy(StrategyTemplate):
         "formula_name",
         "formula_params",
         "max_bars",
-        "min_bars"
+        "min_bars",
+        # 组合层风控（P0-1 / P0-2 / P1-1）
+        "max_gross_exposure",
+        "max_symbol_weight",
+        "dd_level1",
+        "dd_level1_scale",
+        "dd_level2",
+        "dd_level2_pause_days",
+        "vol_target",
+        "vol_lookback",
+        "vol_scale_min",
+        "vol_scale_max",
+        # P1-3 自适应选股
+        "use_trend_filter",
+        "trend_window",
+        "max_pos_strong",
+        "max_pos_normal",
+        "max_pos_weak",
+        "breadth_strong",
+        "breadth_weak"
     ]
     variables = []
 
@@ -345,6 +390,21 @@ class TurtleUsHkStrategy(StrategyTemplate):
             daily_end=self.daily_end_time
         )
 
+        # ---- 组合层风控状态（P0-1 / P0-2 / P1-1）----
+        self.equity: float = float(self.capital)        # 自建权益（逐bar标记市值递推）
+        self.peak_equity: float = float(self.capital)   # 权益历史峰值
+        self.current_drawdown: float = 0.0              # 当前回撤（相对峰值）
+        self.prev_prices: Dict[str, float] = {}         # 上一根bar收盘价（用于市值递推）
+        self.pause_until: datetime | None = None        # 二级熔断暂停开仓截止时间
+        self.daily_closes: Dict[str, deque] = {}        # vt_symbol -> 日收盘价序列（波动率计算）
+        self.realized_vol: float = 0.0                  # 组合已实现年化波动率
+        self.new_open_scale: float = 1.0                # 本期新开仓综合缩放系数
+
+        # P1-3 自适应选股状态
+        self.allowed_symbols: set = set(vt_symbols)     # 允许新开仓的标的集合
+        self.market_breadth: float = 1.0                # 市场广度（均线上方标的占比）
+        self.max_positions: int = 0                     # 当前允许的同时持仓数上限
+
     def on_init(self):
         """初始化"""
         self.write_log("策略初始化")
@@ -375,6 +435,9 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # 全撤之前委托
         self.cancel_all()
 
+        # 组合层风控：更新权益/回撤/新开仓系数（必须在计算目标与下单之前）
+        self._update_risk_state(bars)
+
         # 计算合约目标
         self.calculate_targets(bars)
 
@@ -390,6 +453,22 @@ class TurtleUsHkStrategy(StrategyTemplate):
             signal: TurtleSignal = self.signals[vt_symbol]
             signal.update_daily_bar(bar)
 
+            # 记录日收盘价（P1-1 波动率与 P1-3 趋势选股共用）
+            dq = self.daily_closes.get(vt_symbol)
+            if dq is None:
+                maxlen: int = max(self.vol_lookback, self.trend_window) + 1
+                dq = deque(maxlen=maxlen)
+                self.daily_closes[vt_symbol] = dq
+            dq.append(bar.close_price)
+
+        # P1-1：日K更新后重算已实现波动率
+        if self.vol_target > 0:
+            self._update_realized_vol()
+
+        # P1-3：更新市场广度与允许开仓集合
+        if self.use_trend_filter:
+            self._update_trend_selection()
+
     def calculate_targets(self, bars: Dict[str, BarData]) -> None:
         """计算每个合约的目标"""
         for vt_symbol, bar in bars.items():
@@ -397,38 +476,257 @@ class TurtleUsHkStrategy(StrategyTemplate):
             signal.on_bar(bar)
             self.targets[vt_symbol] = signal.get_target()
 
-    def send_orders(self, bars: Dict[str, BarData]) -> None:
-        """发送委托"""
+    # ------------------------------------------------------------------
+    # 组合层风控（P0-1 / P0-2 / P1-1）
+    # 原则：只削减「实际下单量」，不回写状态机 target；平仓/减仓永不受限
+    # ------------------------------------------------------------------
+    def _update_risk_state(self, bars: Dict[str, BarData]) -> None:
+        """每根 bar 更新权益、回撤、暂停期与新开仓综合缩放系数
+
+        引擎不提供账户净值接口，权益用逐 bar 标记市值递推：
+            equity_t = equity_{t-1} + Σ pos_i × (price_t − price_{t-1})
+        交易成本不在此扣除（占权益比例极小，不影响回撤阈值判定）。
+        """
+        # 1) 权益递推
         for vt_symbol, bar in bars.items():
-            # 计算目标和实际仓位差
+            prev: float | None = self.prev_prices.get(vt_symbol)
+            pos: int = self.get_pos(vt_symbol)
+            if prev and pos:
+                self.equity += pos * (bar.close_price - prev)
+            self.prev_prices[vt_symbol] = bar.close_price
+
+        # 2) 峰值与当前回撤
+        if self.equity > self.peak_equity:
+            self.peak_equity = self.equity
+        if self.peak_equity > 0:
+            self.current_drawdown = max(0.0, (self.peak_equity - self.equity) / self.peak_equity)
+        else:
+            self.current_drawdown = 0.0
+
+        bar: BarData = list(bars.values())[0]
+
+        # 3) 二级熔断暂停期（按日历日近似交易日）
+        if self.pause_until is not None and bar.datetime >= self.pause_until:
+            self.write_log(f"回撤熔断暂停期结束（{self.pause_until}），恢复开仓")
+            self.pause_until = None
+
+        # 4) 综合新开仓系数：熔断与波动率取最小值，避免双重收缩
+        scales: List[float] = [1.0]
+
+        if self.dd_level1 > 0 and self.current_drawdown >= self.dd_level1:
+            scales.append(self.dd_level1_scale)
+
+        if self.dd_level2 > 0 and self.dd_level2 >= self.dd_level1:
+            if self.current_drawdown >= self.dd_level2:
+                if self.pause_until is None:
+                    days: int = max(1, int(self.dd_level2_pause_days * 1.4))
+                    self.pause_until = bar.datetime + timedelta(days=days)
+                    self.write_log(
+                        f"触发二级回撤熔断：当前回撤 {self.current_drawdown:.2%}，"
+                        f"暂停开新仓至 {self.pause_until}"
+                    )
+                scales.append(0.0)
+
+        if self.vol_target > 0 and self.realized_vol > 0:
+            raw: float = self.vol_target / self.realized_vol
+            scales.append(max(self.vol_scale_min, min(self.vol_scale_max, raw)))
+
+        self.new_open_scale = min(scales)
+
+    def _update_realized_vol(self) -> None:
+        """等权组合日收益率的年化已实现波动率（P1-1）"""
+        returns_list: List[np.ndarray] = []
+
+        for dq in self.daily_closes.values():
+            closes = list(dq)
+            if len(closes) < self.vol_lookback + 1:
+                continue
+            arr = np.asarray(closes, dtype=float)
+            returns_list.append(arr[1:] / arr[:-1] - 1.0)
+
+        if not returns_list:
+            self.realized_vol = 0.0
+            return
+
+        n: int = min(len(r) for r in returns_list)
+        matrix = np.vstack([r[-n:] for r in returns_list])
+        mean_rets = matrix.mean(axis=0)
+        self.realized_vol = float(np.std(mean_rets) * np.sqrt(252))
+
+    def _update_trend_selection(self) -> None:
+        """按市场广度动态决定持仓数量上限，并筛选允许新开仓的标的（P1-3）
+
+        广度 = 收盘价在 MA(trend_window) 上方的标的占比：
+            广度 >= breadth_strong  -> 最多 max_pos_strong 只
+            广度 >= breadth_weak    -> 最多 max_pos_normal 只
+            广度 <  breadth_weak    -> 最多 max_pos_weak 只
+
+        候选按「收盘价 / 均线 - 1」的偏离度降序，取前 max_positions 只。
+        已持仓标的始终保留在允许集合内（避免强行平掉盈利头寸，离场交给海龟自身）。
+        """
+        above: List[tuple] = []
+        total: int = 0
+
+        for vt_symbol, dq in self.daily_closes.items():
+            closes = list(dq)
+            if len(closes) < self.trend_window + 1:
+                continue
+
+            total += 1
+            arr = np.asarray(closes, dtype=float)
+            ma: float = float(arr[-self.trend_window:].mean())
+            if ma <= 0:
+                continue
+
+            if arr[-1] > ma:
+                above.append((vt_symbol, arr[-1] / ma - 1.0))
+
+        # 数据不足（预热期）：不限制
+        if total == 0:
+            self.allowed_symbols = set(self.signals.keys())
+            return
+
+        self.market_breadth = len(above) / total
+
+        if self.market_breadth >= self.breadth_strong:
+            self.max_positions = self.max_pos_strong
+        elif self.market_breadth >= self.breadth_weak:
+            self.max_positions = self.max_pos_normal
+        else:
+            self.max_positions = self.max_pos_weak
+
+        above.sort(key=lambda x: x[1], reverse=True)
+        allowed: set = {s for s, _ in above[: self.max_positions]}
+
+        # 已持仓的一律保留
+        for vt_symbol in self.signals.keys():
+            if self.get_pos(vt_symbol):
+                allowed.add(vt_symbol)
+
+        self.allowed_symbols = allowed
+
+    def _cap_target_by_weight(self, vt_symbol: str, target: int, price: float) -> int:
+        """按单标权重上限裁剪目标持仓（P0-1），仅用于新增敞口方向"""
+        if self.max_symbol_weight <= 0 or price <= 0 or target == 0:
+            return target
+
+        lot_size: int = int(self.lot_sizes.get(vt_symbol, 1)) or 1
+        cap_shares: int = int((self.capital * self.max_symbol_weight) / price / lot_size) * lot_size
+
+        if target > 0:
+            return min(target, cap_shares)
+        return max(target, -cap_shares)
+
+    def _cap_new_open_by_exposure(self, plans: List[dict], bars: Dict[str, BarData]) -> None:
+        """按总敞口剩余额度等比缩减新增开仓（P0-1），就地修改 plans 的 diff"""
+        if self.max_gross_exposure <= 0:
+            return
+
+        gross_now: float = 0.0
+        for vt_symbol, bar in bars.items():
+            pos: int = self.get_pos(vt_symbol)
+            if pos:
+                gross_now += abs(pos) * bar.close_price
+
+        # 仅对首次建仓（pos==0）施加总敞口约束；加仓不裁剪，
+        # 否则敞口预算会随价格与持仓市值波动而反复触发调仓
+        open_plans = [p for p in plans if p["is_open"] and p["diff"] and p["pos"] == 0]
+        if not open_plans:
+            return
+
+        budget: float = self.capital * self.max_gross_exposure - gross_now
+        if budget <= 0:
+            for p in open_plans:
+                p["diff"] = 0
+            return
+
+        total: float = sum(abs(p["diff"]) * p["price"] for p in open_plans)
+        if total <= budget:
+            return
+
+        ratio: float = budget / total
+        for p in open_plans:
+            lot_size: int = p["lot"] or 1
+            scaled: int = int(abs(p["diff"]) * ratio / lot_size) * lot_size
+            p["diff"] = scaled if p["diff"] > 0 else -scaled
+
+    def send_orders(self, bars: Dict[str, BarData]) -> None:
+        """发送委托（组合层风控流水线：熔断/波动率 → 单标权重 → 总敞口）"""
+        plans: List[dict] = []
+
+        # 阶段一：收集计划 + 新开仓缩放 + 单标权重裁剪
+        for vt_symbol, bar in bars.items():
             target: int = self.targets[vt_symbol]
             pos: int = self.get_pos(vt_symbol)
-            diff: int = target - pos
+            lot_size: int = int(self.lot_sizes.get(vt_symbol, 1)) or 1
+            price: float = bar.close_price
 
-            # 按每手股数整手对齐，不足一手跳过
-            lot_size: int = int(self.lot_sizes.get(vt_symbol, 1))
-            diff = int(diff / lot_size) * lot_size
+            # 是否属于「新增敞口」方向（开仓或加仓）；平仓/减仓为 False
+            if target > pos:
+                is_open: bool = pos >= 0
+            elif target < pos:
+                is_open: bool = pos <= 0
+            else:
+                is_open = False
+
+            if is_open and target != 0:
+                if self.new_open_scale <= 0:
+                    # 二级熔断：连加仓也禁止，保持现有仓位
+                    target = pos
+                elif pos == 0 and self.new_open_scale < 1.0:
+                    # 一级熔断 / 高波动：仅缩减首次建仓
+                    target = int(target * self.new_open_scale / lot_size) * lot_size
+
+            # P1-3 自适应选股：不在当日允许集合内的标的不开新仓
+            if is_open and pos == 0 and target != 0 and self.use_trend_filter:
+                if vt_symbol not in self.allowed_symbols:
+                    target = pos
+
+            # 权重裁剪仅作用于首次建仓（pos==0）。
+            # 若对已持仓也裁剪，权重上限会随价格波动而变，导致「涨超限卖出、
+            # 跌额度恢复再买入」的高频反复调仓（实测成交笔数放大 7 倍以上）。
+            if is_open and pos == 0:
+                target = self._cap_target_by_weight(vt_symbol, target, price)
+
+            diff: int = int((target - pos) / lot_size) * lot_size
+
+            plans.append({
+                "vt_symbol": vt_symbol,
+                "pos": pos,
+                "target": target,
+                "price": price,
+                "lot": lot_size,
+                "diff": diff,
+                "is_open": is_open,
+            })
+
+        # 阶段二：总敞口等比缩减
+        self._cap_new_open_by_exposure(plans, bars)
+
+        # 阶段三：下单（沿用原有超价与多空方向逻辑）
+        for plan in plans:
+            vt_symbol: str = plan["vt_symbol"]
+            diff: int = plan["diff"]
             if not diff:
                 continue
 
+            pos: int = plan["pos"]
             pricetick: float = self.get_pricetick(vt_symbol)
 
-            # 基于仓位差执行交易
             if diff > 0:
-                price: float = bar.close_price + self.price_add_ticks * pricetick
+                price: float = plan["price"] + self.price_add_ticks * pricetick
 
-                # 由于海龟所有开平仓都会先回到仓位0的情况
-                # 因此只需要考虑本次是开仓还是平仓即可
+                # 海龟所有开平仓都会先回到仓位0，因此只需判断开仓还是平仓
                 if pos < 0:
                     self.cover(vt_symbol, price, abs(diff))
                 else:
                     self.buy(vt_symbol, price, abs(diff))
-            elif diff < 0:
+            else:
                 # 禁止做空时跳过空头开仓（平多头不受影响）
                 if not self.allow_short and pos <= 0:
                     continue
 
-                price: float = bar.close_price - self.price_add_ticks * pricetick
+                price = plan["price"] - self.price_add_ticks * pricetick
 
                 if pos > 0:
                     self.sell(vt_symbol, price, abs(diff))
