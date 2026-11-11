@@ -283,6 +283,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
     use_adx_filter: bool = False         # 是否启用 ADX 开仓过滤
     adx_window: int = 14                 # ADX 周期（Wilder 平滑）
     adx_threshold: float = 25.0          # ADX 阈值，低于此值不开新仓
+    # P1-5 Efficiency Ratio 过滤（默认不启用）：净位移/总波动，同步衡量「趋势效率」
+    use_er_filter: bool = False          # 是否启用 ER 开仓过滤
+    er_window: int = 20                  # ER 回看交易日数
+    er_threshold: float = 0.30           # ER 低于此值视为震荡，不开新仓
 
     # 名称列表
     parameters = [
@@ -327,7 +331,11 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # P1-4 ADX 趋势强度过滤
         "use_adx_filter",
         "adx_window",
-        "adx_threshold"
+        "adx_threshold",
+        # P1-5 Efficiency Ratio 过滤
+        "use_er_filter",
+        "er_window",
+        "er_threshold"
     ]
     variables = []
 
@@ -417,6 +425,9 @@ class TurtleUsHkStrategy(StrategyTemplate):
         self.daily_hlc: Dict[str, deque] = {}           # vt_symbol -> (high, low, close) 序列
         self.adx_values: Dict[str, float] = {}          # vt_symbol -> 当前 ADX 值
 
+        # P1-5 ER 状态
+        self.er_values: Dict[str, float] = {}           # vt_symbol -> 当前 Efficiency Ratio
+
     def on_init(self):
         """初始化"""
         self.write_log("策略初始化")
@@ -494,6 +505,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # P1-4：更新各标的 ADX
         if self.use_adx_filter:
             self._update_adx()
+
+        # P1-5：更新各标的 Efficiency Ratio
+        if self.use_er_filter:
+            self._update_er()
 
     def calculate_targets(self, bars: Dict[str, BarData]) -> None:
         """计算每个合约的目标"""
@@ -697,6 +712,27 @@ class TurtleUsHkStrategy(StrategyTemplate):
 
             self.adx_values[vt_symbol] = float(adx[-1])
 
+    def _update_er(self) -> None:
+        """逐标的计算 Efficiency Ratio（P1-5）
+
+        ER = |C_t − C_{t−n}| / Σ|C_i − C_{i−1}|
+        - 接近 1：价格沿单一方向干净推进（强趋势）
+        - 接近 0：来回震荡，净位移远小于总路径（假突破的温床）
+
+        与 ADX 的区别：ER 是**同步**指标，当日即可判断，不需要等趋势「形成」，
+        因此不会像 ADX 那样延后入场、错过趋势第一段。
+        """
+        for vt_symbol, dq in self.daily_closes.items():
+            closes = list(dq)
+            if len(closes) < self.er_window + 1:
+                continue
+
+            seg = np.asarray(closes[-(self.er_window + 1):], dtype=float)
+            net: float = abs(float(seg[-1] - seg[0]))
+            path: float = float(np.abs(np.diff(seg)).sum())
+
+            self.er_values[vt_symbol] = net / path if path > 0 else 0.0
+
     def _cap_target_by_weight(self, vt_symbol: str, target: int, price: float) -> int:
         """按单标权重上限裁剪目标持仓（P0-1），仅用于新增敞口方向"""
         if self.max_symbol_weight <= 0 or price <= 0 or target == 0:
@@ -777,6 +813,11 @@ class TurtleUsHkStrategy(StrategyTemplate):
             # P1-4 ADX 趋势强度过滤：ADX 不足说明无趋势，不开新仓
             if is_open and pos == 0 and target != 0 and self.use_adx_filter:
                 if self.adx_values.get(vt_symbol, 0.0) < self.adx_threshold:
+                    target = pos
+
+            # P1-5 Efficiency Ratio 过滤：ER 低说明在震荡，突破多为假信号
+            if is_open and pos == 0 and target != 0 and self.use_er_filter:
+                if self.er_values.get(vt_symbol, 0.0) < self.er_threshold:
                     target = pos
 
             # 权重裁剪仅作用于首次建仓（pos==0）。
