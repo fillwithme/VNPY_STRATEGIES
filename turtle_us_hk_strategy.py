@@ -279,6 +279,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
     max_pos_weak: int = 2                # 广度弱时最多持仓数
     breadth_strong: float = 0.7          # 广度 >= 该比例视为强（如 70% 标的在均线上）
     breadth_weak: float = 0.4            # 广度 < 该比例视为弱（如 40%）
+    # P1-4 ADX 趋势强度过滤（默认不启用）：ADX 低于阈值说明无趋势，不追突破
+    use_adx_filter: bool = False         # 是否启用 ADX 开仓过滤
+    adx_window: int = 14                 # ADX 周期（Wilder 平滑）
+    adx_threshold: float = 25.0          # ADX 阈值，低于此值不开新仓
 
     # 名称列表
     parameters = [
@@ -319,7 +323,11 @@ class TurtleUsHkStrategy(StrategyTemplate):
         "max_pos_normal",
         "max_pos_weak",
         "breadth_strong",
-        "breadth_weak"
+        "breadth_weak",
+        # P1-4 ADX 趋势强度过滤
+        "use_adx_filter",
+        "adx_window",
+        "adx_threshold"
     ]
     variables = []
 
@@ -405,6 +413,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
         self.market_breadth: float = 1.0                # 市场广度（均线上方标的占比）
         self.max_positions: int = 0                     # 当前允许的同时持仓数上限
 
+        # P1-4 ADX 状态
+        self.daily_hlc: Dict[str, deque] = {}           # vt_symbol -> (high, low, close) 序列
+        self.adx_values: Dict[str, float] = {}          # vt_symbol -> 当前 ADX 值
+
     def on_init(self):
         """初始化"""
         self.write_log("策略初始化")
@@ -461,6 +473,16 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 self.daily_closes[vt_symbol] = dq
             dq.append(bar.close_price)
 
+            # 记录日 HLC（P1-4 ADX 需要 high/low/close）
+            hq = self.daily_hlc.get(vt_symbol)
+            if hq is None:
+                need: int = max(
+                    self.vol_lookback, self.trend_window, self.adx_window * 2 + 2
+                ) + 1
+                hq = deque(maxlen=need)
+                self.daily_hlc[vt_symbol] = hq
+            hq.append((bar.high_price, bar.low_price, bar.close_price))
+
         # P1-1：日K更新后重算已实现波动率
         if self.vol_target > 0:
             self._update_realized_vol()
@@ -468,6 +490,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # P1-3：更新市场广度与允许开仓集合
         if self.use_trend_filter:
             self._update_trend_selection()
+
+        # P1-4：更新各标的 ADX
+        if self.use_adx_filter:
+            self._update_adx()
 
     def calculate_targets(self, bars: Dict[str, BarData]) -> None:
         """计算每个合约的目标"""
@@ -605,6 +631,72 @@ class TurtleUsHkStrategy(StrategyTemplate):
 
         self.allowed_symbols = allowed
 
+    @staticmethod
+    def _ewm(arr: np.ndarray, alpha: float) -> np.ndarray:
+        """一阶指数平滑（Wilder 平滑即 alpha = 1/n，等价通达信 SMA(X, n, 1)）"""
+        out = np.empty(len(arr), dtype=float)
+        acc: float = float(arr[0])
+        out[0] = acc
+        for i in range(1, len(arr)):
+            acc = acc + alpha * (float(arr[i]) - acc)
+            out[i] = acc
+        return out
+
+    def _update_adx(self) -> None:
+        """逐标的计算 ADX（Wilder 平滑），用于开仓的趋势强度过滤（P1-4）
+
+        ADX 高 = 趋势明确，低 = 震荡；仅在 ADX >= adx_threshold 时允许开新仓，
+        避免海龟在无趋势环境里被假突破反复消耗。
+        """
+        n: int = self.adx_window
+        need: int = n * 2 + 1
+        alpha: float = 1.0 / n
+
+        for vt_symbol, dq in self.daily_hlc.items():
+            bars = list(dq)
+            if len(bars) < need:
+                continue
+
+            highs = np.array([b[0] for b in bars], dtype=float)
+            lows = np.array([b[1] for b in bars], dtype=float)
+            closes = np.array([b[2] for b in bars], dtype=float)
+
+            prev_close = np.concatenate(([closes[0]], closes[:-1]))
+            prev_high = np.concatenate(([highs[0]], highs[:-1]))
+            prev_low = np.concatenate(([lows[0]], lows[:-1]))
+
+            tr = np.maximum(
+                highs - lows,
+                np.maximum(np.abs(highs - prev_close), np.abs(lows - prev_close)),
+            )
+            up = highs - prev_high
+            down = prev_low - lows
+
+            plus_dm = np.where((up > down) & (up > 0.0), up, 0.0)
+            minus_dm = np.where((down > up) & (down > 0.0), down, 0.0)
+
+            # 第一根缺少前值，剔除
+            tr = tr[1:]
+            plus_dm = plus_dm[1:]
+            minus_dm = minus_dm[1:]
+            if len(tr) < n + 1:
+                continue
+
+            tr_s = self._ewm(tr, alpha)
+            plus_s = self._ewm(plus_dm, alpha)
+            minus_s = self._ewm(minus_dm, alpha)
+
+            with np.errstate(divide="ignore", invalid="ignore"):
+                plus_di = 100.0 * plus_s / tr_s
+                minus_di = 100.0 * minus_s / tr_s
+                di_sum = plus_di + minus_di
+                dx = 100.0 * np.abs(plus_di - minus_di) / di_sum
+
+            dx = np.nan_to_num(dx, nan=0.0, posinf=0.0, neginf=0.0)
+            adx = self._ewm(dx, alpha)
+
+            self.adx_values[vt_symbol] = float(adx[-1])
+
     def _cap_target_by_weight(self, vt_symbol: str, target: int, price: float) -> int:
         """按单标权重上限裁剪目标持仓（P0-1），仅用于新增敞口方向"""
         if self.max_symbol_weight <= 0 or price <= 0 or target == 0:
@@ -680,6 +772,11 @@ class TurtleUsHkStrategy(StrategyTemplate):
             # P1-3 自适应选股：不在当日允许集合内的标的不开新仓
             if is_open and pos == 0 and target != 0 and self.use_trend_filter:
                 if vt_symbol not in self.allowed_symbols:
+                    target = pos
+
+            # P1-4 ADX 趋势强度过滤：ADX 不足说明无趋势，不开新仓
+            if is_open and pos == 0 and target != 0 and self.use_adx_filter:
+                if self.adx_values.get(vt_symbol, 0.0) < self.adx_threshold:
                     target = pos
 
             # 权重裁剪仅作用于首次建仓（pos==0）。
