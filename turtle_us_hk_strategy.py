@@ -287,6 +287,11 @@ class TurtleUsHkStrategy(StrategyTemplate):
     use_er_filter: bool = False          # 是否启用 ER 开仓过滤
     er_window: int = 20                  # ER 回看交易日数
     er_threshold: float = 0.30           # ER 低于此值视为震荡，不开新仓
+    # P1-6 风险预算恒定（默认不启用）：持仓数越少、单只预算越大
+    use_risk_budget: bool = False        # 是否启用动态单只仓位（基准数 / 当前持仓上限）
+    risk_budget_base: int = 10           # 基准持仓数，通常等于股票池大小
+    # P1-7 固定预算：每只标的建仓金额 = capital / 当前允许持仓数
+    use_fixed_budget: bool = False       # 是否启用「按持仓数均分资金」的单只预算上限
 
     # 名称列表
     parameters = [
@@ -335,7 +340,12 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # P1-5 Efficiency Ratio 过滤
         "use_er_filter",
         "er_window",
-        "er_threshold"
+        "er_threshold",
+        # P1-6 风险预算恒定
+        "use_risk_budget",
+        "risk_budget_base",
+        # P1-7 固定预算（按持仓数均分资金）
+        "use_fixed_budget"
     ]
     variables = []
 
@@ -794,6 +804,20 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 is_open = False
 
             if is_open and target != 0:
+                # P1-6 风险预算恒定：持仓数越少，单只预算越大
+                # （后续仍受单标权重上限与总敞口上限约束，不会无限放大）
+                if pos == 0 and self.use_risk_budget and self.max_positions > 0:
+                    budget_scale: float = self.risk_budget_base / self.max_positions
+                    target = int(target * budget_scale / lot_size) * lot_size
+
+                # P1-7 固定预算：单只建仓金额 <= capital / 当前允许持仓数
+                # 持仓上限越少（弱市），单只预算越大；仍受单标权重与总敞口上限约束
+                if pos == 0 and self.use_fixed_budget and self.max_positions > 0:
+                    budget: float = self.capital / self.max_positions
+                    budget_shares: int = int(budget / price / lot_size) * lot_size
+                    if abs(target) > budget_shares:
+                        target = budget_shares if target > 0 else -budget_shares
+
                 if self.new_open_scale <= 0:
                     # 二级熔断：连加仓也禁止，保持现有仓位
                     target = pos
