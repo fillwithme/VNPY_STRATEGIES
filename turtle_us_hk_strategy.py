@@ -746,7 +746,13 @@ class TurtleUsHkStrategy(StrategyTemplate):
         return max(target, -cap_shares)
 
     def _cap_new_open_by_exposure(self, plans: List[dict], bars: Dict[str, BarData]) -> None:
-        """按总敞口剩余额度等比缩减新增开仓（P0-1），就地修改 plans 的 diff"""
+        """按总敞口剩余额度约束新增敞口（P0-1），就地修改 plans 的 diff
+
+        规则：
+        1. 额度不足时**整笔拒绝**（不做等比缩减），避免每天买一点造成大量碎单；
+        2. 约束覆盖首次建仓**与加仓**，否则 4 级金字塔会让持仓变成首仓的 4 倍，
+           总敞口被加仓悄悄突破（实测会退化成约 5 倍隐含杠杆）。
+        """
         if self.max_gross_exposure <= 0:
             return
 
@@ -756,27 +762,17 @@ class TurtleUsHkStrategy(StrategyTemplate):
             if pos:
                 gross_now += abs(pos) * bar.close_price
 
-        # 仅对首次建仓（pos==0）施加总敞口约束；加仓不裁剪，
-        # 否则敞口预算会随价格与持仓市值波动而反复触发调仓
-        open_plans = [p for p in plans if p["is_open"] and p["diff"] and p["pos"] == 0]
-        if not open_plans:
-            return
-
         budget: float = self.capital * self.max_gross_exposure - gross_now
-        if budget <= 0:
-            for p in open_plans:
+
+        for p in plans:
+            if not p["is_open"] or not p["diff"]:
+                continue
+
+            need: float = abs(p["diff"]) * p["price"]
+            if budget <= 0 or need > budget:
                 p["diff"] = 0
-            return
-
-        total: float = sum(abs(p["diff"]) * p["price"] for p in open_plans)
-        if total <= budget:
-            return
-
-        ratio: float = budget / total
-        for p in open_plans:
-            lot_size: int = p["lot"] or 1
-            scaled: int = int(abs(p["diff"]) * ratio / lot_size) * lot_size
-            p["diff"] = scaled if p["diff"] > 0 else -scaled
+            else:
+                budget -= need
 
     def send_orders(self, bars: Dict[str, BarData]) -> None:
         """发送委托（组合层风控流水线：熔断/波动率 → 单标权重 → 总敞口）"""
