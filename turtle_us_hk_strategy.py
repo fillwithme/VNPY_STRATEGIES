@@ -294,6 +294,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
     use_fixed_budget: bool = False       # 是否启用「按持仓数均分资金」的单只预算上限
     # P1-8 单笔加仓金额上限（默认不启用）：防止跳级时一次性买满
     max_addon_amount: float = 0.0        # 单笔加仓的最大金额（计价货币）；0=不启用
+    # P1-9 相对强度过滤（默认不启用）：只买强于市场平均的标的
+    use_rs_filter: bool = False          # 是否启用相对强度过滤
+    rs_window: int = 60                  # 相对强度回看交易日数
+    rs_threshold: float = 0.0            # 只买 RS 大于该阈值（0=强于市场平均；0.02=强 2%）
 
     # 名称列表
     parameters = [
@@ -349,7 +353,11 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # P1-7 固定预算（按持仓数均分资金）
         "use_fixed_budget",
         # P1-8 单笔加仓金额上限
-        "max_addon_amount"
+        "max_addon_amount",
+        # P1-9 相对强度过滤
+        "use_rs_filter",
+        "rs_window",
+        "rs_threshold"
     ]
     variables = []
 
@@ -439,6 +447,9 @@ class TurtleUsHkStrategy(StrategyTemplate):
         self.daily_hlc: Dict[str, deque] = {}           # vt_symbol -> (high, low, close) 序列
         self.adx_values: Dict[str, float] = {}          # vt_symbol -> 当前 ADX 值
 
+        # P1-9 相对强度状态
+        self.rs_values: Dict[str, float] = {}           # vt_symbol -> N 日收益减市场平均
+
         # P1-5 ER 状态
         self.er_values: Dict[str, float] = {}           # vt_symbol -> 当前 Efficiency Ratio
 
@@ -490,10 +501,12 @@ class TurtleUsHkStrategy(StrategyTemplate):
             signal: TurtleSignal = self.signals[vt_symbol]
             signal.update_daily_bar(bar)
 
-            # 记录日收盘价（P1-1 波动率与 P1-3 趋势选股共用）
+            # 记录日收盘价（P1-1 波动率 / P1-3 趋势选股 / P1-9 相对强度共用）
             dq = self.daily_closes.get(vt_symbol)
             if dq is None:
-                maxlen: int = max(self.vol_lookback, self.trend_window) + 1
+                maxlen: int = max(
+                    self.vol_lookback, self.trend_window, self.rs_window
+                ) + 1
                 dq = deque(maxlen=maxlen)
                 self.daily_closes[vt_symbol] = dq
             dq.append(bar.close_price)
@@ -519,6 +532,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # P1-4：更新各标的 ADX
         if self.use_adx_filter:
             self._update_adx()
+
+        # P1-9：更新各标的相对强度
+        if self.use_rs_filter:
+            self._update_rs_filter()
 
         # P1-5：更新各标的 Efficiency Ratio
         if self.use_er_filter:
@@ -747,6 +764,35 @@ class TurtleUsHkStrategy(StrategyTemplate):
 
             self.er_values[vt_symbol] = net / path if path > 0 else 0.0
 
+    def _update_rs_filter(self) -> None:
+        """计算各标的相对市场平均的强度（P1-9）
+
+        RS = 标的过去 N 日收益 − 股票池平均 N 日收益
+
+        RS > 0 表示跑赢市场平均（强者恒强），RS < 0 表示落后。
+        只看「近期」相对强弱，不依赖全历史盈亏，因此是**前瞻性**筛选，
+        与「剔除历史亏损标的」的后视镜做法有本质区别。
+        """
+        returns: Dict[str, float] = {}
+
+        for vt_symbol, dq in self.daily_closes.items():
+            closes = list(dq)
+            if len(closes) < self.rs_window + 1:
+                continue
+
+            past: float = closes[-(self.rs_window + 1)]
+            if past <= 0:
+                continue
+
+            returns[vt_symbol] = closes[-1] / past - 1.0
+
+        if not returns:
+            return
+
+        avg: float = sum(returns.values()) / len(returns)
+        for vt_symbol, ret in returns.items():
+            self.rs_values[vt_symbol] = ret - avg
+
     def _cap_target_by_weight(self, vt_symbol: str, target: int, price: float) -> int:
         """按单标权重上限裁剪目标持仓（P0-1），仅用于新增敞口方向"""
         if self.max_symbol_weight <= 0 or price <= 0 or target == 0:
@@ -842,6 +888,11 @@ class TurtleUsHkStrategy(StrategyTemplate):
             # P1-5 Efficiency Ratio 过滤：ER 低说明在震荡，突破多为假信号
             if is_open and pos == 0 and target != 0 and self.use_er_filter:
                 if self.er_values.get(vt_symbol, 0.0) < self.er_threshold:
+                    target = pos
+
+            # P1-9 相对强度过滤：跑输市场平均的标的不开新仓
+            if is_open and pos == 0 and target != 0 and self.use_rs_filter:
+                if self.rs_values.get(vt_symbol, 0.0) < self.rs_threshold:
                     target = pos
 
             # 权重裁剪仅作用于首次建仓（pos==0）。
