@@ -292,6 +292,8 @@ class TurtleUsHkStrategy(StrategyTemplate):
     risk_budget_base: int = 10           # 基准持仓数，通常等于股票池大小
     # P1-7 固定预算：每只标的建仓金额 = capital / 当前允许持仓数
     use_fixed_budget: bool = False       # 是否启用「按持仓数均分资金」的单只预算上限
+    # P1-8 单笔加仓金额上限（默认不启用）：防止跳级时一次性买满
+    max_addon_amount: float = 0.0        # 单笔加仓的最大金额（计价货币）；0=不启用
 
     # 名称列表
     parameters = [
@@ -345,7 +347,9 @@ class TurtleUsHkStrategy(StrategyTemplate):
         "use_risk_budget",
         "risk_budget_base",
         # P1-7 固定预算（按持仓数均分资金）
-        "use_fixed_budget"
+        "use_fixed_budget",
+        # P1-8 单笔加仓金额上限
+        "max_addon_amount"
     ]
     variables = []
 
@@ -845,6 +849,13 @@ class TurtleUsHkStrategy(StrategyTemplate):
             # 跌额度恢复再买入」的高频反复调仓（实测成交笔数放大 7 倍以上）。
             if is_open and pos == 0:
                 target = self._cap_target_by_weight(vt_symbol, target, price)
+
+            # P1-8 单笔加仓金额上限：价格跳空触发多个加仓档位时，拆成多笔买入，
+            # 避免在 1.5N 处一次性买满（海龟原版应在 0.5N / 1.0N / 1.5N 分批）
+            if is_open and pos > 0 and self.max_addon_amount > 0:
+                addon_cap: int = int(self.max_addon_amount / price / lot_size) * lot_size
+                if target - pos > addon_cap:
+                    target = pos + addon_cap
 
             diff: int = int((target - pos) / lot_size) * lot_size
 
