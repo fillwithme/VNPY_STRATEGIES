@@ -303,6 +303,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
     max_short_normal: int = 0            # 中等市允许做空的标的数上限
     max_short_weak: int = 0              # 弱市允许做空的标的数上限
     max_long_weak: int = 0               # 弱市允许做多的标的数上限（0=沿用 max_pos_weak）
+    max_short_addon_level: int = 0       # 做空单日加仓级数上限（0=不限制，1=每天最多加 1 级）
 
     # 名称列表
     parameters = [
@@ -367,7 +368,9 @@ class TurtleUsHkStrategy(StrategyTemplate):
         "max_short_strong",
         "max_short_normal",
         "max_short_weak",
-        "max_long_weak"
+        "max_long_weak",
+        # P1-11 做空单日加仓级数上限
+        "max_short_addon_level"
     ]
     variables = []
 
@@ -456,6 +459,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # P1-10 多空分离状态
         self.allowed_long: set = set(vt_symbols)        # 允许开多的标的
         self.allowed_short: set = set()                 # 允许开空的标的
+        self.deviation: Dict[str, float] = {}           # vt_symbol -> 相对 MA 偏离度（排名依据）
 
         # P1-4 ADX 状态
         self.daily_hlc: Dict[str, deque] = {}           # vt_symbol -> (high, low, close) 序列
@@ -655,6 +659,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
         above: List[tuple] = []
         below: List[tuple] = []
         total: int = 0
+        deviation: Dict[str, float] = {}
 
         for vt_symbol, dq in self.daily_closes.items():
             closes = list(dq)
@@ -668,6 +673,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 continue
 
             dev: float = arr[-1] / ma - 1.0
+            deviation[vt_symbol] = dev
             if dev > 0:
                 above.append((vt_symbol, dev))
             else:
@@ -703,7 +709,16 @@ class TurtleUsHkStrategy(StrategyTemplate):
 
         # 做空：偏离度升序（跌得最惨的优先）
         below.sort(key=lambda x: x[1])
-        allowed_short: set = {s for s, _ in below[:short_cap]}
+        if (
+            self.max_short_strong == 0
+            and self.max_short_normal == 0
+            and self.max_short_weak == 0
+        ):
+            # 三个做空名额都未配置：视为「不做方向限制」，保持旧行为
+            # （空头机会由总敞口额度自然约束，即「简单多空」模式）
+            allowed_short: set = {s for s, _ in below}
+        else:
+            allowed_short = {s for s, _ in below[:short_cap]}
 
         # 已持仓的标的按方向保留
         for vt_symbol in self.signals.keys():
@@ -716,6 +731,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
         self.allowed_long = allowed_long
         self.allowed_short = allowed_short
         self.allowed_symbols = allowed_long | allowed_short
+        self.deviation = deviation
 
     @staticmethod
     def _ewm(arr: np.ndarray, alpha: float) -> np.ndarray:
@@ -864,7 +880,9 @@ class TurtleUsHkStrategy(StrategyTemplate):
 
         budget: float = self.capital * self.max_gross_exposure - gross_now
 
-        for p in plans:
+        # 按排名分降序分配额度：优先满足「最强多头」与「最弱空头」
+        # 避免因 vt_symbols 配置顺序导致「差标的」先占额度
+        for p in sorted(plans, key=lambda x: x.get("rank", 0.0), reverse=True):
             if not p["is_open"] or not p["diff"]:
                 continue
 
@@ -950,7 +968,25 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 if target - pos > addon_cap:
                     target = pos + addon_cap
 
+            # P1-11 做空单日加仓级数上限：每天最多加 N 级，避免跳空时一天打满 4 级
+            if (
+                is_open
+                and pos <= 0
+                and target < pos
+                and self.max_short_addon_level > 0
+            ):
+                signal: TurtleSignal = self.signals[vt_symbol]
+                unit_shares: int = int(signal.unit / lot_size) * lot_size
+                if unit_shares > 0:
+                    max_add: int = unit_shares * self.max_short_addon_level
+                    if pos - target > max_add:
+                        target = pos - max_add
+
             diff: int = int((target - pos) / lot_size) * lot_size
+
+            # 排名分：做多按偏离度降序（越强越优先），做空按偏离度升序（越弱越优先）
+            dev: float = self.deviation.get(vt_symbol, 0.0)
+            rank_score: float = dev if target > 0 else -dev
 
             plans.append({
                 "vt_symbol": vt_symbol,
@@ -960,6 +996,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 "lot": lot_size,
                 "diff": diff,
                 "is_open": is_open,
+                "rank": rank_score,
             })
 
         # 阶段二：总敞口等比缩减
