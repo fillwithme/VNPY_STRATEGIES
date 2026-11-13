@@ -298,6 +298,11 @@ class TurtleUsHkStrategy(StrategyTemplate):
     use_rs_filter: bool = False          # 是否启用相对强度过滤
     rs_window: int = 60                  # 相对强度回看交易日数
     rs_threshold: float = 0.0            # 只买 RS 大于该阈值（0=强于市场平均；0.02=强 2%）
+    # P1-10 多空分离名额（默认不启用）：弱市把名额倾斜给空头
+    max_short_strong: int = 0            # 强市允许做空的标的数上限（0=不做空）
+    max_short_normal: int = 0            # 中等市允许做空的标的数上限
+    max_short_weak: int = 0              # 弱市允许做空的标的数上限
+    max_long_weak: int = 0               # 弱市允许做多的标的数上限（0=沿用 max_pos_weak）
 
     # 名称列表
     parameters = [
@@ -357,7 +362,12 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # P1-9 相对强度过滤
         "use_rs_filter",
         "rs_window",
-        "rs_threshold"
+        "rs_threshold",
+        # P1-10 多空分离名额
+        "max_short_strong",
+        "max_short_normal",
+        "max_short_weak",
+        "max_long_weak"
     ]
     variables = []
 
@@ -439,9 +449,13 @@ class TurtleUsHkStrategy(StrategyTemplate):
         self.new_open_scale: float = 1.0                # 本期新开仓综合缩放系数
 
         # P1-3 自适应选股状态
-        self.allowed_symbols: set = set(vt_symbols)     # 允许新开仓的标的集合
+        self.allowed_symbols: set = set(vt_symbols)     # 允许新开仓的标的集合（多空并集）
         self.market_breadth: float = 1.0                # 市场广度（均线上方标的占比）
         self.max_positions: int = 0                     # 当前允许的同时持仓数上限
+
+        # P1-10 多空分离状态
+        self.allowed_long: set = set(vt_symbols)        # 允许开多的标的
+        self.allowed_short: set = set()                 # 允许开空的标的
 
         # P1-4 ADX 状态
         self.daily_hlc: Dict[str, deque] = {}           # vt_symbol -> (high, low, close) 序列
@@ -626,17 +640,20 @@ class TurtleUsHkStrategy(StrategyTemplate):
         self.realized_vol = float(np.std(mean_rets) * np.sqrt(252))
 
     def _update_trend_selection(self) -> None:
-        """按市场广度动态决定持仓数量上限，并筛选允许新开仓的标的（P1-3）
+        """按市场广度动态决定多空名额，并筛选允许开仓的标的（P1-3 + P1-10）
 
         广度 = 收盘价在 MA(trend_window) 上方的标的占比：
-            广度 >= breadth_strong  -> 最多 max_pos_strong 只
-            广度 >= breadth_weak    -> 最多 max_pos_normal 只
-            广度 <  breadth_weak    -> 最多 max_pos_weak 只
+            广度 >= breadth_strong  -> 做多 max_pos_strong 只，做空 max_short_strong 只
+            广度 >= breadth_weak    -> 做多 max_pos_normal 只，做空 max_short_normal 只
+            广度 <  breadth_weak    -> 做多 max_long_weak（0 则用 max_pos_weak），
+                                       做空 max_short_weak 只
 
-        候选按「收盘价 / 均线 - 1」的偏离度降序，取前 max_positions 只。
-        已持仓标的始终保留在允许集合内（避免强行平掉盈利头寸，离场交给海龟自身）。
+        做多候选 = MA 上方的标的，按偏离度降序（越强越优先）
+        做空候选 = MA 下方的标的，按偏离度升序（跌得最惨的优先）
+        已持仓标的按方向保留，离场交给海龟自身止损。
         """
         above: List[tuple] = []
+        below: List[tuple] = []
         total: int = 0
 
         for vt_symbol, dq in self.daily_closes.items():
@@ -650,32 +667,55 @@ class TurtleUsHkStrategy(StrategyTemplate):
             if ma <= 0:
                 continue
 
-            if arr[-1] > ma:
-                above.append((vt_symbol, arr[-1] / ma - 1.0))
+            dev: float = arr[-1] / ma - 1.0
+            if dev > 0:
+                above.append((vt_symbol, dev))
+            else:
+                below.append((vt_symbol, dev))
 
         # 数据不足（预热期）：不限制
         if total == 0:
             self.allowed_symbols = set(self.signals.keys())
+            self.allowed_long = set(self.signals.keys())
+            self.allowed_short = set()
             return
 
         self.market_breadth = len(above) / total
 
+        # 按广度决定多空名额
+        long_cap: int
+        short_cap: int
         if self.market_breadth >= self.breadth_strong:
-            self.max_positions = self.max_pos_strong
+            long_cap = self.max_pos_strong
+            short_cap = self.max_short_strong
         elif self.market_breadth >= self.breadth_weak:
-            self.max_positions = self.max_pos_normal
+            long_cap = self.max_pos_normal
+            short_cap = self.max_short_normal
         else:
-            self.max_positions = self.max_pos_weak
+            long_cap = self.max_long_weak if self.max_long_weak > 0 else self.max_pos_weak
+            short_cap = self.max_short_weak
 
+        self.max_positions = long_cap + short_cap
+
+        # 做多：偏离度降序（越强越优先）
         above.sort(key=lambda x: x[1], reverse=True)
-        allowed: set = {s for s, _ in above[: self.max_positions]}
+        allowed_long: set = {s for s, _ in above[:long_cap]}
 
-        # 已持仓的一律保留
+        # 做空：偏离度升序（跌得最惨的优先）
+        below.sort(key=lambda x: x[1])
+        allowed_short: set = {s for s, _ in below[:short_cap]}
+
+        # 已持仓的标的按方向保留
         for vt_symbol in self.signals.keys():
-            if self.get_pos(vt_symbol):
-                allowed.add(vt_symbol)
+            pos: int = self.get_pos(vt_symbol)
+            if pos > 0:
+                allowed_long.add(vt_symbol)
+            elif pos < 0:
+                allowed_short.add(vt_symbol)
 
-        self.allowed_symbols = allowed
+        self.allowed_long = allowed_long
+        self.allowed_short = allowed_short
+        self.allowed_symbols = allowed_long | allowed_short
 
     @staticmethod
     def _ewm(arr: np.ndarray, alpha: float) -> np.ndarray:
@@ -875,9 +915,11 @@ class TurtleUsHkStrategy(StrategyTemplate):
                     # 一级熔断 / 高波动：仅缩减首次建仓
                     target = int(target * self.new_open_scale / lot_size) * lot_size
 
-            # P1-3 自适应选股：不在当日允许集合内的标的不开新仓
+            # P1-3 + P1-10 自适应选股：按方向检查各自的允许集合
             if is_open and pos == 0 and target != 0 and self.use_trend_filter:
-                if vt_symbol not in self.allowed_symbols:
+                if target > 0 and vt_symbol not in self.allowed_long:
+                    target = pos
+                elif target < 0 and vt_symbol not in self.allowed_short:
                     target = pos
 
             # P1-4 ADX 趋势强度过滤：ADX 不足说明无趋势，不开新仓
