@@ -707,8 +707,9 @@ class TurtleUsHkStrategy(StrategyTemplate):
         above.sort(key=lambda x: x[1], reverse=True)
         allowed_long: set = {s for s, _ in above[:long_cap]}
 
-        # 做空：偏离度升序（跌得最惨的优先）
-        below.sort(key=lambda x: x[1])
+        # 做空：按「接近 MA60」排序（刚跌破的优先）
+        # 刚跌破的下跌空间更大；跌得最惨的往往已接近超跌反弹区
+        below.sort(key=lambda x: abs(x[1]))
         if (
             self.max_short_strong == 0
             and self.max_short_normal == 0
@@ -984,9 +985,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
 
             diff: int = int((target - pos) / lot_size) * lot_size
 
-            # 排名分：做多按偏离度降序（越强越优先），做空按偏离度升序（越弱越优先）
+            # 排名分：做多按偏离度降序（越强越优先）；
+            # 做空按「接近 MA60」排序（刚跌破的优先，与候选筛选保持一致）
             dev: float = self.deviation.get(vt_symbol, 0.0)
-            rank_score: float = dev if target > 0 else -dev
+            rank_score: float = dev if target > 0 else -abs(dev)
 
             plans.append({
                 "vt_symbol": vt_symbol,
