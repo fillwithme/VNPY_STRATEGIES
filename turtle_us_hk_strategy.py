@@ -304,6 +304,9 @@ class TurtleUsHkStrategy(StrategyTemplate):
     max_short_weak: int = 0              # 弱市允许做空的标的数上限
     max_long_weak: int = 0               # 弱市允许做多的标的数上限（0=沿用 max_pos_weak）
     max_short_addon_level: int = 0       # 做空单日加仓级数上限（0=不限制，1=每天最多加 1 级）
+    # P1-12 分方向敞口上限（默认不启用）：多头与空头各用一份额度
+    max_long_exposure: float = 0.0       # 多头敞口上限（capital 倍数），0=不启用分方向模式
+    max_short_exposure: float = 0.0      # 空头敞口上限（capital 倍数），0=不启用分方向模式
 
     # 名称列表
     parameters = [
@@ -370,7 +373,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
         "max_short_weak",
         "max_long_weak",
         # P1-11 做空单日加仓级数上限
-        "max_short_addon_level"
+        "max_short_addon_level",
+        # P1-12 分方向敞口上限
+        "max_long_exposure",
+        "max_short_exposure"
     ]
     variables = []
 
@@ -870,28 +876,59 @@ class TurtleUsHkStrategy(StrategyTemplate):
         2. 约束覆盖首次建仓**与加仓**，否则 4 级金字塔会让持仓变成首仓的 4 倍，
            总敞口被加仓悄悄突破（实测会退化成约 5 倍隐含杠杆）。
         """
-        if self.max_gross_exposure <= 0:
+        use_split: bool = self.max_long_exposure > 0 or self.max_short_exposure > 0
+        if not use_split and self.max_gross_exposure <= 0:
             return
 
-        gross_now: float = 0.0
+        long_gross: float = 0.0
+        short_gross: float = 0.0
+        total_gross: float = 0.0
         for vt_symbol, bar in bars.items():
             pos: int = self.get_pos(vt_symbol)
-            if pos:
-                gross_now += abs(pos) * bar.close_price
+            if not pos:
+                continue
+            value: float = abs(pos) * bar.close_price
+            total_gross += value
+            if pos > 0:
+                long_gross += value
+            else:
+                short_gross += value
 
-        budget: float = self.capital * self.max_gross_exposure - gross_now
+        if use_split:
+            # 分方向模式：多头与空头各用一份额度
+            long_budget: float = self.capital * self.max_long_exposure - long_gross
+            short_budget: float = self.capital * self.max_short_exposure - short_gross
+            budget: float = 0.0
+        else:
+            # 总量模式：多空共用一份额度（原行为）
+            budget = self.capital * self.max_gross_exposure - total_gross
+            long_budget = budget
+            short_budget = budget
 
-        # 按排名分降序分配额度：优先满足「最强多头」与「最弱空头」
+        # 按排名分降序分配额度：优先满足「最强多头」与「最接近 MA60 的空头」
         # 避免因 vt_symbols 配置顺序导致「差标的」先占额度
         for p in sorted(plans, key=lambda x: x.get("rank", 0.0), reverse=True):
             if not p["is_open"] or not p["diff"]:
                 continue
 
             need: float = abs(p["diff"]) * p["price"]
-            if budget <= 0 or need > budget:
-                p["diff"] = 0
+
+            if use_split:
+                if p["diff"] > 0:
+                    if long_budget <= 0 or need > long_budget:
+                        p["diff"] = 0
+                    else:
+                        long_budget -= need
+                else:
+                    if short_budget <= 0 or need > short_budget:
+                        p["diff"] = 0
+                    else:
+                        short_budget -= need
             else:
-                budget -= need
+                if budget <= 0 or need > budget:
+                    p["diff"] = 0
+                else:
+                    budget -= need
 
     def send_orders(self, bars: Dict[str, BarData]) -> None:
         """发送委托（组合层风控流水线：熔断/波动率 → 单标权重 → 总敞口）"""
