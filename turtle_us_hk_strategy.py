@@ -1004,9 +1004,8 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 if self.rs_values.get(vt_symbol, 0.0) < self.rs_threshold:
                     target = pos
 
-            # P1-14 空头「反弹过滤」：不追急跌，只等反弹接近均线时开空
-            # 港股急跌后 1~2 天反弹 5~8%，在急跌末端开空极易被 2N 止损打掉；
-            # 该过滤器要求价格距均线的距离不超过 1N（说明已反弹回来），否则不开空。
+            # P1-14 空头「反弹过滤」：价格在均线下方（急跌中）不开空，
+            # 只在价格站上均线（反弹确认）时开空，避免追在急跌末端被 2N 止损打掉。
             if (
                 is_open
                 and pos == 0
@@ -1019,9 +1018,8 @@ class TurtleUsHkStrategy(StrategyTemplate):
                     ma: float = (
                         sum(closes[-self.short_rebound_ma:]) / self.short_rebound_ma
                     )
-                    n_val: float = self.signals[vt_symbol].machine.n
-                    if n_val > 0 and price < ma - n_val:
-                        # 距均线仍超过 1N = 急跌中，不追
+                    if price < ma:
+                        # 价格仍在均线下方 = 急跌中，不追空
                         target = pos
 
             # 权重裁剪仅作用于首次建仓（pos==0）。
