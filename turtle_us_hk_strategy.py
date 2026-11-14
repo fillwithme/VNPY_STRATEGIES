@@ -307,6 +307,11 @@ class TurtleUsHkStrategy(StrategyTemplate):
     # P1-12 分方向敞口上限（默认不启用）：多头与空头各用一份额度
     max_long_exposure: float = 0.0       # 多头敞口上限（capital 倍数），0=不启用分方向模式
     max_short_exposure: float = 0.0      # 空头敞口上限（capital 倍数），0=不启用分方向模式
+    # P1-13 做空止损倍数（默认 2.0 = 海龟原版）：港股急跌后反弹 5~8%，2N 常被打掉
+    short_stop_mult: float = 2.0         # 做空止损距离 = N × 该倍数
+    # P1-14 空头「反弹过滤」（默认不启用）：不追急跌，等反弹接近均线再开空
+    use_short_rebound_filter: bool = False
+    short_rebound_ma: int = 5            # 反弹参考均线周期（日线）
 
     # 名称列表
     parameters = [
@@ -376,7 +381,12 @@ class TurtleUsHkStrategy(StrategyTemplate):
         "max_short_addon_level",
         # P1-12 分方向敞口上限
         "max_long_exposure",
-        "max_short_exposure"
+        "max_short_exposure",
+        # P1-13 做空止损倍数
+        "short_stop_mult",
+        # P1-14 空头反弹过滤
+        "use_short_rebound_filter",
+        "short_rebound_ma"
     ]
     variables = []
 
@@ -425,6 +435,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 formula_params=formula_params_dict,
                 max_bars=self.max_bars,
                 min_bars=self.min_bars,
+                short_stop_mult=self.short_stop_mult,
             )
 
             self.signals[vt_symbol] = TurtleSignal(
@@ -992,6 +1003,26 @@ class TurtleUsHkStrategy(StrategyTemplate):
             if is_open and pos == 0 and target != 0 and self.use_rs_filter:
                 if self.rs_values.get(vt_symbol, 0.0) < self.rs_threshold:
                     target = pos
+
+            # P1-14 空头「反弹过滤」：不追急跌，只等反弹接近均线时开空
+            # 港股急跌后 1~2 天反弹 5~8%，在急跌末端开空极易被 2N 止损打掉；
+            # 该过滤器要求价格距均线的距离不超过 1N（说明已反弹回来），否则不开空。
+            if (
+                is_open
+                and pos == 0
+                and target < 0
+                and self.use_short_rebound_filter
+                and self.short_rebound_ma > 0
+            ):
+                closes = list(self.daily_closes.get(vt_symbol, []))
+                if len(closes) >= self.short_rebound_ma:
+                    ma: float = (
+                        sum(closes[-self.short_rebound_ma:]) / self.short_rebound_ma
+                    )
+                    n_val: float = self.signals[vt_symbol].machine.n
+                    if n_val > 0 and price < ma - n_val:
+                        # 距均线仍超过 1N = 急跌中，不追
+                        target = pos
 
             # 权重裁剪仅作用于首次建仓（pos==0）。
             # 若对已持仓也裁剪，权重上限会随价格波动而变，导致「涨超限卖出、
