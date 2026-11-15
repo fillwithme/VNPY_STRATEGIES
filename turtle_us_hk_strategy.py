@@ -146,8 +146,8 @@ from typing import Dict, List
 
 import numpy as np
 
-from vnpy.trader.constant import Interval
-from vnpy.trader.object import BarData, TickData
+from vnpy.trader.constant import Direction, Interval
+from vnpy.trader.object import BarData, TickData, TradeData
 
 from vnpy_portfoliostrategy import (
     StrategyEngine,
@@ -312,6 +312,15 @@ class TurtleUsHkStrategy(StrategyTemplate):
     # P1-14 空头「反弹过滤」（默认不启用）：不追急跌，等反弹接近均线再开空
     use_short_rebound_filter: bool = False
     short_rebound_ma: int = 5            # 反弹参考均线周期（日线）
+    # P1-15 多空分开预算（默认不启用）：多头与空头各用一份预算池
+    use_split_budget: bool = False       # 是否按多空分别计算单只预算
+    long_budget_ratio: float = 0.5       # 多头预算占总资金比例（剩余归空头）
+    # P1-16 敞口按持仓成本计算（默认不启用）：避免浮盈锁死加仓额度
+    use_cost_exposure: bool = False      # 用持仓成本替代市值计算敞口
+    # P1-17 ER 分位数过滤（默认不启用）：用相对排名替代固定阈值
+    use_er_percentile: bool = False      # 是否用 ER 历史分位替代固定阈值
+    er_percentile: float = 0.5           # 只做 ER 高于该分位的标的（0.5=前 50%）
+    er_percentile_window: int = 250      # ER 历史分位窗口（交易日）
 
     # 名称列表
     parameters = [
@@ -386,7 +395,16 @@ class TurtleUsHkStrategy(StrategyTemplate):
         "short_stop_mult",
         # P1-14 空头反弹过滤
         "use_short_rebound_filter",
-        "short_rebound_ma"
+        "short_rebound_ma",
+        # P1-15 多空分开预算
+        "use_split_budget",
+        "long_budget_ratio",
+        # P1-16 敞口按成本计算
+        "use_cost_exposure",
+        # P1-17 ER 分位数
+        "use_er_percentile",
+        "er_percentile",
+        "er_percentile_window"
     ]
     variables = []
 
@@ -477,6 +495,12 @@ class TurtleUsHkStrategy(StrategyTemplate):
         self.allowed_long: set = set(vt_symbols)        # 允许开多的标的
         self.allowed_short: set = set()                 # 允许开空的标的
         self.deviation: Dict[str, float] = {}           # vt_symbol -> 相对 MA 偏离度（排名依据）
+
+        # P1-15/P1-16/P1-17 状态
+        self.long_cap: int = 0                          # 当前多头名额（P1-15 用）
+        self.short_cap: int = 0                         # 当前空头名额（P1-15 用）
+        self.cost_basis: Dict[str, float] = {}          # vt_symbol -> 持仓成本（买入为正，做空为负）
+        self.er_history: Dict[str, deque] = {}          # vt_symbol -> ER 历史序列（P1-17 用）
 
         # P1-4 ADX 状态
         self.daily_hlc: Dict[str, deque] = {}           # vt_symbol -> (high, low, close) 序列
@@ -719,6 +743,8 @@ class TurtleUsHkStrategy(StrategyTemplate):
             short_cap = self.max_short_weak
 
         self.max_positions = long_cap + short_cap
+        self.long_cap = long_cap
+        self.short_cap = short_cap
 
         # 做多：偏离度降序（越强越优先）
         above.sort(key=lambda x: x[1], reverse=True)
@@ -836,7 +862,15 @@ class TurtleUsHkStrategy(StrategyTemplate):
             net: float = abs(float(seg[-1] - seg[0]))
             path: float = float(np.abs(np.diff(seg)).sum())
 
-            self.er_values[vt_symbol] = net / path if path > 0 else 0.0
+            er_val: float = net / path if path > 0 else 0.0
+            self.er_values[vt_symbol] = er_val
+
+            # P1-17：记录 ER 历史，供分位数过滤使用
+            hist = self.er_history.get(vt_symbol)
+            if hist is None:
+                hist = deque(maxlen=self.er_percentile_window)
+                self.er_history[vt_symbol] = hist
+            hist.append(er_val)
 
     def _update_rs_filter(self) -> None:
         """计算各标的相对市场平均的强度（P1-9）
@@ -866,6 +900,19 @@ class TurtleUsHkStrategy(StrategyTemplate):
         avg: float = sum(returns.values()) / len(returns)
         for vt_symbol, ret in returns.items():
             self.rs_values[vt_symbol] = ret - avg
+
+    def on_trade(self, trade: TradeData) -> None:
+        """成交回报：维护持仓成本（P1-16 敞口按成本计算用）
+
+        买入累加成本、卖出递减、做空则为负值，平仓后自然归零。
+        """
+        super().on_trade(trade)
+
+        vt_symbol: str = trade.vt_symbol
+        sign: float = 1.0 if trade.direction == Direction.LONG else -1.0
+        self.cost_basis[vt_symbol] = (
+            self.cost_basis.get(vt_symbol, 0.0) + sign * trade.price * trade.volume
+        )
 
     def _cap_target_by_weight(self, vt_symbol: str, target: int, price: float) -> int:
         """按单标权重上限裁剪目标持仓（P0-1），仅用于新增敞口方向"""
@@ -898,7 +945,13 @@ class TurtleUsHkStrategy(StrategyTemplate):
             pos: int = self.get_pos(vt_symbol)
             if not pos:
                 continue
-            value: float = abs(pos) * bar.close_price
+
+            if self.use_cost_exposure:
+                # P1-16：用持仓成本而非市值，避免浮盈锁死加仓额度
+                value: float = abs(self.cost_basis.get(vt_symbol, 0.0))
+            else:
+                value = abs(pos) * bar.close_price
+
             total_gross += value
             if pos > 0:
                 long_gross += value
@@ -967,10 +1020,29 @@ class TurtleUsHkStrategy(StrategyTemplate):
                     budget_scale: float = self.risk_budget_base / self.max_positions
                     target = int(target * budget_scale / lot_size) * lot_size
 
-                # P1-7 固定预算：单只建仓金额 <= capital / 当前允许持仓数
+                # P1-7 固定预算 / P1-15 多空分开预算
                 # 持仓上限越少（弱市），单只预算越大；仍受单标权重与总敞口上限约束
                 if pos == 0 and self.use_fixed_budget and self.max_positions > 0:
-                    budget: float = self.capital / self.max_positions
+                    budget: float
+                    if (
+                        self.use_split_budget
+                        and self.long_cap > 0
+                        and self.short_cap > 0
+                    ):
+                        # 多头与空头各用一份预算池，弱市不因「空头名额多」而稀释多头
+                        if target > 0:
+                            budget = (
+                                self.capital * self.long_budget_ratio / self.long_cap
+                            )
+                        else:
+                            budget = (
+                                self.capital
+                                * (1.0 - self.long_budget_ratio)
+                                / self.short_cap
+                            )
+                    else:
+                        budget = self.capital / self.max_positions
+
                     budget_shares: int = int(budget / price / lot_size) * lot_size
                     if abs(target) > budget_shares:
                         target = budget_shares if target > 0 else -budget_shares
@@ -994,9 +1066,22 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 if self.adx_values.get(vt_symbol, 0.0) < self.adx_threshold:
                     target = pos
 
-            # P1-5 Efficiency Ratio 过滤：ER 低说明在震荡，突破多为假信号
+            # P1-5 / P1-17 Efficiency Ratio 过滤：
+            # 固定阈值（原）或历史分位（自适应，消除牛熊市阈值松紧不一的问题）
             if is_open and pos == 0 and target != 0 and self.use_er_filter:
-                if self.er_values.get(vt_symbol, 0.0) < self.er_threshold:
+                er_now: float = self.er_values.get(vt_symbol, 0.0)
+                if self.use_er_percentile:
+                    hist = self.er_history.get(vt_symbol)
+                    if hist is not None and len(hist) >= 30:
+                        threshold: float = float(
+                            np.percentile(
+                                np.asarray(hist, dtype=float),
+                                self.er_percentile * 100.0,
+                            )
+                        )
+                        if er_now < threshold:
+                            target = pos
+                elif er_now < self.er_threshold:
                     target = pos
 
             # P1-9 相对强度过滤：跑输市场平均的标的不开新仓
@@ -1024,7 +1109,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
 
             # 权重裁剪仅作用于首次建仓（pos==0）。
             # 若对已持仓也裁剪，权重上限会随价格波动而变，导致「涨超限卖出、
-            # 跌额度恢复再买入」的高频反复调仓（实测成交笔数放大 7 倍以上）。
+            # 跌额度恢复再买入」的高频反复调仓（实测成交笔数放大 58 倍以上）。
             if is_open and pos == 0:
                 target = self._cap_target_by_weight(vt_symbol, target, price)
 
