@@ -321,6 +321,8 @@ class TurtleUsHkStrategy(StrategyTemplate):
     use_er_percentile: bool = False      # 是否用 ER 历史分位替代固定阈值
     er_percentile: float = 0.5           # 只做 ER 高于该分位的标的（0.5=前 50%）
     er_percentile_window: int = 250      # ER 历史分位窗口（交易日）
+    # P1-18 横截面分位（默认不启用）：当天所有标的中排名，替代逐标的历史分位
+    er_cross_sectional: bool = False     # True=横截面（当天排名），False=时序（逐标的历史）
 
     # 名称列表
     parameters = [
@@ -404,7 +406,9 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # P1-17 ER 分位数
         "use_er_percentile",
         "er_percentile",
-        "er_percentile_window"
+        "er_percentile_window",
+        # P1-18 横截面分位
+        "er_cross_sectional"
     ]
     variables = []
 
@@ -501,6 +505,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
         self.short_cap: int = 0                         # 当前空头名额（P1-15 用）
         self.cost_basis: Dict[str, float] = {}          # vt_symbol -> 持仓成本（买入为正，做空为负）
         self.er_history: Dict[str, deque] = {}          # vt_symbol -> ER 历史序列（P1-17 用）
+        self.er_pass: set = set()                       # P1-18 横截面分位通过的标的
 
         # P1-4 ADX 状态
         self.daily_hlc: Dict[str, deque] = {}           # vt_symbol -> (high, low, close) 序列
@@ -872,6 +877,18 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 self.er_history[vt_symbol] = hist
             hist.append(er_val)
 
+        # P1-18 横截面分位：当天所有标的的 ER 排名（同一天、同一标准）
+        # 与 P1-17 时序分位的区别：不看各自历史，只比今天的强弱
+        if self.use_er_percentile and self.er_cross_sectional and self.er_values:
+            symbols = list(self.er_values.keys())
+            values = np.asarray(
+                [self.er_values[s] for s in symbols], dtype=float
+            )
+            cut: float = float(
+                np.percentile(values, self.er_percentile * 100.0)
+            )
+            self.er_pass = {s for s in symbols if self.er_values[s] >= cut}
+
     def _update_rs_filter(self) -> None:
         """计算各标的相对市场平均的强度（P1-9）
 
@@ -1070,7 +1087,12 @@ class TurtleUsHkStrategy(StrategyTemplate):
             # 固定阈值（原）或历史分位（自适应，消除牛熊市阈值松紧不一的问题）
             if is_open and pos == 0 and target != 0 and self.use_er_filter:
                 er_now: float = self.er_values.get(vt_symbol, 0.0)
-                if self.use_er_percentile:
+                if self.use_er_percentile and self.er_cross_sectional:
+                    # P1-18 横截面：当天排名未进入前 (1-er_percentile) 的不开仓
+                    if self.er_pass and vt_symbol not in self.er_pass:
+                        target = pos
+                elif self.use_er_percentile:
+                    # P1-17 时序：与该标的自身历史分位比较
                     hist = self.er_history.get(vt_symbol)
                     if hist is not None and len(hist) >= 30:
                         threshold: float = float(
