@@ -349,6 +349,9 @@ class TurtleUsHkStrategy(StrategyTemplate):
     heartbeat_dir: str = ""              # 心跳目录（空=当前目录 state/）
     alert_drawdown: float = 0.0          # 回撤告警阈值（如 0.30 表示 30%），0=不启用
     emergency_flatten_file: str = ""     # 应急平仓标记文件：存在则清空目标仓位（只平仓不开新）
+    # 换池过渡期：遗留标的只允许减仓/平仓，禁止加仓或开新仓
+    # 用途：从旧标的池切换到新池时，旧池持仓平滑退出，避免在不合适点位被迫全平
+    legacy_symbols: list = []
 
     # 名称列表
     parameters = [
@@ -447,7 +450,8 @@ class TurtleUsHkStrategy(StrategyTemplate):
         "heartbeat_enabled",
         "heartbeat_dir",
         "alert_drawdown",
-        "emergency_flatten_file"
+        "emergency_flatten_file",
+        "legacy_symbols"
     ]
     variables = []
 
@@ -944,6 +948,12 @@ class TurtleUsHkStrategy(StrategyTemplate):
             signal: TurtleSignal = self.signals[vt_symbol]
             signal.on_bar(bar)
             self.targets[vt_symbol] = signal.get_target()
+
+            # 换池过渡期：遗留标的只允许减仓/平仓，禁止加仓或开新仓
+            if vt_symbol in self.legacy_symbols:
+                pos = self.get_pos(vt_symbol)
+                if abs(self.targets[vt_symbol]) > abs(pos):
+                    self.targets[vt_symbol] = pos
 
     # ------------------------------------------------------------------
     # 组合层风控（P0-1 / P0-2 / P1-1）
