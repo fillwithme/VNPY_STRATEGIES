@@ -338,6 +338,12 @@ class TurtleUsHkStrategy(StrategyTemplate):
     export_fills_daily: bool = False     # 每日收盘自动导出执行监控（覆盖写）
     fills_dir: str = ""                  # 执行监控输出目录（空=当前目录下的 output/）
     log_version_info: bool = True        # 启动时记录代码 commit 与配置指纹（版本锁定）
+    # 初始化加载天数（重要）
+    #   回测：等于「预热期天数」，引擎会跳过前 N 天不参与统计（backtesting.py:215），
+    #         改动会平移回测区间，因此必须保持 30。
+    #   实盘：等于「从数据库加载的历史天数」，必须覆盖 250 根日线（约 400 自然日），
+    #         否则 machine.inited 一直为 False，策略永不 开仓。
+    init_load_days: int = 30             # 实盘配置请设为 400
 
     # 名称列表
     parameters = [
@@ -430,7 +436,8 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # 实盘运维
         "export_fills_daily",
         "fills_dir",
-        "log_version_info"
+        "log_version_info",
+        "init_load_days"
     ]
     variables = []
 
@@ -550,8 +557,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
         """初始化"""
         self.write_log("策略初始化")
 
-        # 加载用于初始化的数据天数，需要超过所需最长的窗口
-        self.load_bars(30)
+        # 加载历史数据天数。
+        # 回测里该值等于「预热期天数」（引擎跳过前 N 天不参与统计），保持 30 以复现基线；
+        # 实盘里该值等于「从数据库加载的天数」，需设为 400（覆盖 250 根日线）才能真正预热。
+        self.load_bars(self.init_load_days)
 
     def on_start(self):
         """启动"""
