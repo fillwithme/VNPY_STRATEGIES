@@ -344,6 +344,11 @@ class TurtleUsHkStrategy(StrategyTemplate):
     # 说明：load_bars 在回测里是「预热期天数」（跳过前 N 天不计成绩），
     #       在实盘里是「从数据库加载的历史天数」（需覆盖 250 根日线）。
     init_load_days: int = 0
+    # 实盘可观测性（默认关闭，不影响回测）
+    heartbeat_enabled: bool = False      # 心跳：每分钟写一次状态文件，面板据此判断是否存活
+    heartbeat_dir: str = ""              # 心跳目录（空=当前目录 state/）
+    alert_drawdown: float = 0.0          # 回撤告警阈值（如 0.30 表示 30%），0=不启用
+    emergency_flatten_file: str = ""     # 应急平仓标记文件：存在则清空目标仓位（只平仓不开新）
 
     # 名称列表
     parameters = [
@@ -437,7 +442,12 @@ class TurtleUsHkStrategy(StrategyTemplate):
         "export_fills_daily",
         "fills_dir",
         "log_version_info",
-        "init_load_days"
+        "init_load_days",
+        # 实盘可观测性
+        "heartbeat_enabled",
+        "heartbeat_dir",
+        "alert_drawdown",
+        "emergency_flatten_file"
     ]
     variables = []
 
@@ -543,6 +553,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
         self.order_intents: Dict[str, int] = {}         # vt_symbol -> 累计下单股数（算成交率）
         self.fill_volumes: Dict[str, int] = {}          # vt_symbol -> 累计成交股数
 
+        # 实盘可观测性状态
+        self._last_heartbeat_key: str = ""              # 上次心跳的分钟键（限频，避免每根 bar 写文件）
+        self._alert_sent_dd: bool = False               # 回撤告警是否已发送（避免刷屏）
+
         # P1-4 ADX 状态
         self.daily_hlc: Dict[str, deque] = {}           # vt_symbol -> (high, low, close) 序列
         self.adx_values: Dict[str, float] = {}          # vt_symbol -> 当前 ADX 值
@@ -618,6 +632,68 @@ class TurtleUsHkStrategy(StrategyTemplate):
             f"[version] strategy={self.strategy_name} commit={commit} config_hash={config_hash}"
         )
         self.write_log(f"[version] params={payload}")
+
+    def _write_heartbeat(self, dt) -> None:
+        """写心跳文件（控制面板据此判断策略是否存活）
+
+        每分钟最多写一次，避免 IO 过多；内容含持仓与广度，面板可直接展示。
+        """
+        key: str = dt.strftime("%Y%m%d%H%M")
+        if key == self._last_heartbeat_key:
+            return
+        self._last_heartbeat_key = key
+
+        base = Path(self.heartbeat_dir) if self.heartbeat_dir else Path.cwd() / "state"
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return
+
+        payload: dict = {
+            "time": dt.isoformat(),
+            "strategy": self.strategy_name,
+            "breadth": round(self.market_breadth, 4),
+            "max_positions": self.max_positions,
+            "positions": {
+                s: self.get_pos(s) for s in self.vt_symbols if self.get_pos(s)
+            },
+            "fill_count": len(self.fill_records),
+        }
+
+        path = base / f"heartbeat_{self.strategy_name}.json"
+        try:
+            path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass
+
+    def diagnose(self) -> str:
+        """输出「为什么现在不开仓」的诊断信息（面板/日志可调用）"""
+        lines: List[str] = []
+        lines.append(f"市场广度      : {self.market_breadth:.1%}")
+        lines.append(f"持仓名额上限  : {self.max_positions}")
+        lines.append(f"允许做多      : {sorted(self.allowed_long) or '（无）'}")
+
+        holdings = {s: self.get_pos(s) for s in self.vt_symbols if self.get_pos(s)}
+        lines.append(f"当前持仓      : {holdings or '（空仓）'}")
+
+        if self.use_cost_exposure:
+            gross = sum(abs(v) for v in self.cost_basis.values())
+            cap = self.capital * self.max_gross_exposure
+            lines.append(f"敞口（按成本）: {gross:,.0f} / {cap:,.0f}")
+            if gross >= cap:
+                lines.append("  -> 敞口已满，这是不开新仓的直接原因")
+
+        lines.append("")
+        lines.append("各标的状态（ER / 是否允许 / 持仓）：")
+        for vt_symbol in self.vt_symbols:
+            er = self.er_values.get(vt_symbol, 0.0)
+            allowed = vt_symbol in self.allowed_long
+            pos = self.get_pos(vt_symbol)
+            lines.append(
+                f"  {vt_symbol:22s} ER={er:.2f} 允许={'是' if allowed else '否'} 持仓={pos}"
+            )
+
+        return "\n".join(lines)
 
     def _auto_export_fills(self) -> None:
         """每日收盘自动导出执行监控（P0-2），无需人工干预"""
@@ -784,6 +860,18 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # 全撤之前委托
         self.cancel_all()
 
+        # 实盘心跳：记录最近行情时间与持仓，供控制面板判断策略是否存活
+        if self.heartbeat_enabled:
+            self._write_heartbeat(bar.datetime)
+
+        # 应急平仓：检测到标记文件时清空目标仓位（只平仓，不开新仓）
+        if self.emergency_flatten_file and Path(self.emergency_flatten_file).exists():
+            if not getattr(self, "_emergency_logged", False):
+                self.write_log("检测到应急平仓标记，清空所有目标仓位")
+                self._emergency_logged = True
+            for vt_symbol in self.vt_symbols:
+                self.targets[vt_symbol] = 0
+
         # 组合层风控：更新权益/回撤/新开仓系数（必须在计算目标与下单之前）
         self._update_risk_state(bars)
 
@@ -883,6 +971,18 @@ class TurtleUsHkStrategy(StrategyTemplate):
             self.current_drawdown = max(0.0, (self.peak_equity - self.equity) / self.peak_equity)
         else:
             self.current_drawdown = 0.0
+
+        # 回撤告警：触发一次，回落到阈值 80% 以下后重置，避免反复刷屏
+        # 通知走 vnpy 的 send_notification（邮件需在全局配置里启用 SMTP）
+        if self.alert_drawdown > 0:
+            if self.current_drawdown >= self.alert_drawdown and not self._alert_sent_dd:
+                self.send_notification(
+                    f"回撤告警：当前回撤 {self.current_drawdown:.1%}，"
+                    f"超过阈值 {self.alert_drawdown:.0%}"
+                )
+                self._alert_sent_dd = True
+            elif self.current_drawdown < self.alert_drawdown * 0.8:
+                self._alert_sent_dd = False
 
         bar: BarData = list(bars.values())[0]
 
