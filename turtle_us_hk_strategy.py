@@ -334,6 +334,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
     # IB Gateway 每日 23:45 强制断开，重启后若不恢复 target/entry/n，会重复开仓或漏平仓
     use_state_persist: bool = False      # 是否在启动时恢复、每日收盘后保存状态
     state_dir: str = ""                  # 状态文件目录（空=当前工作目录下的 state/）
+    # 实盘运维（默认关闭，不影响回测）
+    export_fills_daily: bool = False     # 每日收盘自动导出执行监控（覆盖写）
+    fills_dir: str = ""                  # 执行监控输出目录（空=当前目录下的 output/）
+    log_version_info: bool = True        # 启动时记录代码 commit 与配置指纹（版本锁定）
 
     # 名称列表
     parameters = [
@@ -422,7 +426,11 @@ class TurtleUsHkStrategy(StrategyTemplate):
         "er_cross_sectional",
         # P0-3 状态持久化
         "use_state_persist",
-        "state_dir"
+        "state_dir",
+        # 实盘运维
+        "export_fills_daily",
+        "fills_dir",
+        "log_version_info"
     ]
     variables = []
 
@@ -549,9 +557,107 @@ class TurtleUsHkStrategy(StrategyTemplate):
         """启动"""
         self.write_log("策略启动")
 
+        # 版本锁定：记录代码 commit 与配置指纹，便于事后归因
+        if self.log_version_info:
+            self._log_version_info()
+
         # P0-3：优先恢复上次退出时的状态机状态（防断线重启后"失忆"）
         if self.use_state_persist:
             self._load_state()
+
+    def _log_version_info(self) -> None:
+        """启动时记录代码版本与配置指纹（版本锁定）
+
+        目的：三个月后回看「当时为什么亏」，能精确知道跑的是哪个 commit、哪份配置。
+        git 命令失败（不在仓库里）不影响策略启动。
+        """
+        import hashlib
+        import subprocess
+
+        commit: str = "unknown"
+        try:
+            commit = subprocess.check_output(
+                ["git", "-C", r"C:\Users\sandytaoli\strategies", "rev-parse", "--short", "HEAD"],
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            ).decode().strip()
+        except Exception:
+            pass
+
+        try:
+            payload: str = json.dumps(
+                {k: getattr(self, k) for k in self.parameters if hasattr(self, k)},
+                sort_keys=True,
+                default=str,
+            )
+        except Exception:
+            payload = "{}"
+
+        config_hash: str = hashlib.md5(payload.encode()).hexdigest()[:8]
+        self.write_log(
+            f"[version] strategy={self.strategy_name} commit={commit} config_hash={config_hash}"
+        )
+        self.write_log(f"[version] params={payload}")
+
+    def _auto_export_fills(self) -> None:
+        """每日收盘自动导出执行监控（P0-2），无需人工干预"""
+        if not self.fill_records:
+            return
+
+        from pathlib import Path
+
+        try:
+            base = Path(self.fills_dir) if self.fills_dir else Path.cwd() / "output"
+            base.mkdir(parents=True, exist_ok=True)
+            path = base / f"fills_live_{self.strategy_name}.csv"
+            self.export_fill_report(str(path))
+
+            # 同时导出持仓快照，供日终对账（reconcile.py）使用
+            pos_path = base / f"positions_live_{self.strategy_name}.csv"
+            self.export_positions(str(pos_path))
+        except Exception as exc:                # 导出失败不阻断交易
+            self.write_log(f"[fills] 自动导出失败: {exc}")
+
+    def export_positions(self, csv_path: str) -> str:
+        """导出当前持仓快照（日终对账用）
+
+        只记录策略「认为」的持仓；与券商实际持仓的差异由 reconcile.py 比对。
+        """
+        import csv
+
+        rows: List[dict] = []
+        for vt_symbol in self.signals.keys():
+            pos: int = self.get_pos(vt_symbol)
+            if not pos:
+                continue
+
+            machine = self.signals[vt_symbol].machine
+            cost: float = self.cost_basis.get(vt_symbol, 0.0)
+            rows.append(
+                {
+                    "vt_symbol": vt_symbol,
+                    "pos": pos,
+                    "target_level": int(machine.target),
+                    "cost_basis": round(cost, 2),
+                    "avg_cost": round(abs(cost / pos), 4) if pos else 0.0,
+                }
+            )
+
+        with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "vt_symbol",
+                    "pos",
+                    "target_level",
+                    "cost_basis",
+                    "avg_cost",
+                ],
+            )
+            writer.writeheader()
+            writer.writerows(rows)
+
+        return csv_path
 
     def on_stop(self):
         """停止"""
@@ -719,6 +825,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # P0-3：每日收盘后落盘（防 IB 每日强制断线导致重启后失忆）
         if self.use_state_persist:
             self._save_state()
+
+        # P0-2：每日收盘自动导出执行监控（无需人工干预）
+        if self.export_fills_daily:
+            self._auto_export_fills()
 
     def calculate_targets(self, bars: Dict[str, BarData]) -> None:
         """计算每个合约的目标"""
@@ -1058,6 +1168,11 @@ class TurtleUsHkStrategy(StrategyTemplate):
             # 买入成交价高于信号价 = 正滑点（成本）；卖出方向取反，使「吃亏」恒为正
             slippage_bps = raw * 10000.0 * sign
 
+        # 交易日志（含决策上下文）：把当时的 ER、市场广度、目标层级一并记下，
+        # 事后复盘能看出「这笔是在什么环境下开的」；note/emotion 留空供人工填写
+        machine = (
+            self.signals[vt_symbol].machine if vt_symbol in self.signals else None
+        )
         self.fill_records.append(
             {
                 "datetime": trade.datetime,
@@ -1068,6 +1183,11 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 "fill_price": trade.price,
                 "signal_price": signal_price,
                 "slippage_bps": slippage_bps,
+                "er": round(self.er_values.get(vt_symbol, 0.0), 4),
+                "breadth": round(self.market_breadth, 4),
+                "target_level": int(machine.target) if machine else 0,
+                "note": "",
+                "emotion": "",
             }
         )
 
@@ -1098,6 +1218,11 @@ class TurtleUsHkStrategy(StrategyTemplate):
                     "fill_price",
                     "signal_price",
                     "slippage_bps",
+                    "er",
+                    "breadth",
+                    "target_level",
+                    "note",
+                    "emotion",
                 ],
             )
             writer.writeheader()
