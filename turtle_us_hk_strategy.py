@@ -330,6 +330,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
     er_percentile_window: int = 250      # ER 历史分位窗口（交易日）
     # P1-18 横截面分位（默认不启用）：当天所有标的中排名，替代逐标的历史分位
     er_cross_sectional: bool = False     # True=横截面（当天排名），False=时序（逐标的历史）
+    # P0-3 状态持久化（默认不启用）：断线重启后恢复状态机，避免"失忆"错单
+    # IB Gateway 每日 23:45 强制断开，重启后若不恢复 target/entry/n，会重复开仓或漏平仓
+    use_state_persist: bool = False      # 是否在启动时恢复、每日收盘后保存状态
+    state_dir: str = ""                  # 状态文件目录（空=当前工作目录下的 state/）
 
     # 名称列表
     parameters = [
@@ -415,7 +419,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
         "er_percentile",
         "er_percentile_window",
         # P1-18 横截面分位
-        "er_cross_sectional"
+        "er_cross_sectional",
+        # P0-3 状态持久化
+        "use_state_persist",
+        "state_dir"
     ]
     variables = []
 
@@ -514,6 +521,13 @@ class TurtleUsHkStrategy(StrategyTemplate):
         self.er_history: Dict[str, deque] = {}          # vt_symbol -> ER 历史序列（P1-17 用）
         self.er_pass: set = set()                       # P1-18 横截面分位通过的标的
 
+        # P0-2 订单执行监控：记录每笔的信号价、委托价、成交价与滑点
+        # 目的是把「回测假设的 5bp 滑点」与「实盘真实滑点」对齐，评估成本侵蚀
+        self.fill_records: List[dict] = []              # 成交记录（含滑点，单位 bps）
+        self.signal_prices: Dict[str, float] = {}       # vt_symbol -> 最近一次下单的信号价
+        self.order_intents: Dict[str, int] = {}         # vt_symbol -> 累计下单股数（算成交率）
+        self.fill_volumes: Dict[str, int] = {}          # vt_symbol -> 累计成交股数
+
         # P1-4 ADX 状态
         self.daily_hlc: Dict[str, deque] = {}           # vt_symbol -> (high, low, close) 序列
         self.adx_values: Dict[str, float] = {}          # vt_symbol -> 当前 ADX 值
@@ -535,9 +549,99 @@ class TurtleUsHkStrategy(StrategyTemplate):
         """启动"""
         self.write_log("策略启动")
 
+        # P0-3：优先恢复上次退出时的状态机状态（防断线重启后"失忆"）
+        if self.use_state_persist:
+            self._load_state()
+
     def on_stop(self):
         """停止"""
         self.write_log("策略停止")
+
+        # P0-3：退出前落盘，保证下次启动可恢复
+        if self.use_state_persist:
+            self._save_state()
+
+    def _state_file(self):
+        """状态文件路径（P0-3）"""
+        from pathlib import Path
+
+        base = Path(self.state_dir) if self.state_dir else Path.cwd() / "state"
+        base.mkdir(parents=True, exist_ok=True)
+        return base / f"{self.strategy_name}.json"
+
+    def _save_state(self) -> None:
+        """保存状态机关键字段到磁盘（P0-3）
+
+        只保存「冻结语义」相关的字段：target / entry / n / inited。
+        cci 与 traded 每根/每日重置，无需持久化。
+        使用临时文件 + 原子替换，避免写入中断导致文件损坏。
+        """
+        data: Dict[str, dict] = {}
+        for vt_symbol, signal in self.signals.items():
+            machine = signal.machine
+            data[vt_symbol] = {
+                "target": int(machine.target),
+                "long_entry": float(machine.long_entry),
+                "short_entry": float(machine.short_entry),
+                "n": float(machine.n),
+                "entry_up": float(machine.entry_up),
+                "entry_down": float(machine.entry_down),
+                "exit_up": float(machine.exit_up),
+                "exit_down": float(machine.exit_down),
+                "inited": bool(machine.inited),
+            }
+
+        try:
+            path = self._state_file()
+            tmp = path.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            tmp.replace(path)
+        except Exception as exc:                    # 持久化失败不阻断交易
+            self.write_log(f"[state] 保存失败: {exc}")
+
+    def _load_state(self) -> None:
+        """从磁盘恢复状态机（P0-3）
+
+        恢复后强制 inited=True：日线缓冲会由后续行情继续追加，
+        但入场通道与 N 值必须保留，否则会按新价格重新冻结、导致止损线错位。
+        """
+        try:
+            path = self._state_file()
+        except Exception as exc:
+            self.write_log(f"[state] 目录创建失败: {exc}")
+            return
+
+        if not path.exists():
+            self.write_log(f"[state] 无历史状态，按全新状态运行: {path}")
+            return
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as exc:
+            self.write_log(f"[state] 读取失败，按全新状态运行: {exc}")
+            return
+
+        restored: int = 0
+        for vt_symbol, fields in data.items():
+            signal = self.signals.get(vt_symbol)
+            if signal is None:
+                continue
+
+            machine = signal.machine
+            machine.target = int(fields.get("target", 0))
+            machine.long_entry = float(fields.get("long_entry", 0.0))
+            machine.short_entry = float(fields.get("short_entry", 0.0))
+            machine.n = float(fields.get("n", 0.0))
+            machine.entry_up = float(fields.get("entry_up", 0.0))
+            machine.entry_down = float(fields.get("entry_down", 0.0))
+            machine.exit_up = float(fields.get("exit_up", 0.0))
+            machine.exit_down = float(fields.get("exit_down", 0.0))
+            machine.inited = True
+            restored += 1
+
+        self.write_log(f"[state] 已恢复 {restored} 个标的的状态: {path}")
 
     def on_tick(self, tick: TickData):
         """Tick推送"""
@@ -611,6 +715,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # P1-5：更新各标的 Efficiency Ratio
         if self.use_er_filter:
             self._update_er()
+
+        # P0-3：每日收盘后落盘（防 IB 每日强制断线导致重启后失忆）
+        if self.use_state_persist:
+            self._save_state()
 
     def calculate_targets(self, bars: Dict[str, BarData]) -> None:
         """计算每个合约的目标"""
@@ -926,7 +1034,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
             self.rs_values[vt_symbol] = ret - avg
 
     def on_trade(self, trade: TradeData) -> None:
-        """成交回报：维护持仓成本（P1-16 敞口按成本计算用）
+        """成交回报：维护持仓成本（P1-16 敞口按成本计算用）与执行监控（P0-2）
 
         买入累加成本、卖出递减、做空则为负值，平仓后自然归零。
         """
@@ -936,6 +1044,116 @@ class TurtleUsHkStrategy(StrategyTemplate):
         sign: float = 1.0 if trade.direction == Direction.LONG else -1.0
         self.cost_basis[vt_symbol] = (
             self.cost_basis.get(vt_symbol, 0.0) + sign * trade.price * trade.volume
+        )
+
+        # P0-2 订单执行监控：记录成交价与信号价，计算滑点
+        signal_price: float = self.signal_prices.get(vt_symbol, 0.0)
+        self.fill_volumes[vt_symbol] = (
+            self.fill_volumes.get(vt_symbol, 0) + trade.volume
+        )
+
+        slippage_bps: float = 0.0
+        if signal_price > 0:
+            raw: float = (trade.price - signal_price) / signal_price
+            # 买入成交价高于信号价 = 正滑点（成本）；卖出方向取反，使「吃亏」恒为正
+            slippage_bps = raw * 10000.0 * sign
+
+        self.fill_records.append(
+            {
+                "datetime": trade.datetime,
+                "vt_symbol": vt_symbol,
+                "direction": trade.direction.value,
+                "offset": trade.offset.value,
+                "volume": trade.volume,
+                "fill_price": trade.price,
+                "signal_price": signal_price,
+                "slippage_bps": slippage_bps,
+            }
+        )
+
+    def export_fill_report(self, csv_path: str) -> str:
+        """导出订单执行监控报告（P0-2）
+
+        输出两个部分：
+        1. 逐笔明细（成交价 / 信号价 / 滑点 bps）
+        2. 按标的汇总（成交率、平均滑点、总成交金额）
+
+        返回实际写出的文件路径。
+        """
+        if not self.fill_records:
+            return ""
+
+        import csv
+
+        detail_path: str = csv_path
+        with open(detail_path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "datetime",
+                    "vt_symbol",
+                    "direction",
+                    "offset",
+                    "volume",
+                    "fill_price",
+                    "signal_price",
+                    "slippage_bps",
+                ],
+            )
+            writer.writeheader()
+            writer.writerows(self.fill_records)
+
+        # 按标的汇总
+        summary_path: str = csv_path.replace(".csv", "_summary.csv")
+        symbols: List[str] = sorted(
+            {r["vt_symbol"] for r in self.fill_records}
+        )
+        with open(summary_path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    "vt_symbol",
+                    "fill_count",
+                    "fill_volume",
+                    "order_volume",
+                    "fill_rate",
+                    "avg_slippage_bps",
+                    "max_slippage_bps",
+                    "min_slippage_bps",
+                    "turnover",
+                ]
+            )
+            for vt_symbol in symbols:
+                rows = [r for r in self.fill_records if r["vt_symbol"] == vt_symbol]
+                slips = [r["slippage_bps"] for r in rows]
+                fill_vol: int = self.fill_volumes.get(vt_symbol, 0)
+                order_vol: int = self.order_intents.get(vt_symbol, 0)
+                rate: float = (fill_vol / order_vol) if order_vol > 0 else 0.0
+                writer.writerow(
+                    [
+                        vt_symbol,
+                        len(rows),
+                        fill_vol,
+                        order_vol,
+                        round(rate, 4),
+                        round(sum(slips) / len(slips), 2) if slips else 0.0,
+                        round(max(slips), 2) if slips else 0.0,
+                        round(min(slips), 2) if slips else 0.0,
+                        round(
+                            sum(r["fill_price"] * r["volume"] for r in rows), 2
+                        ),
+                    ]
+                )
+
+        return summary_path
+
+    def _record_order_intent(
+        self, vt_symbol: str, price: float, volume: int
+    ) -> None:
+        """记录下单意图（P0-2 订单执行监控：用于计算成交率与滑点基准）"""
+        self.signal_prices[vt_symbol] = price
+        self.order_intents[vt_symbol] = (
+            self.order_intents.get(vt_symbol, 0) + volume
         )
 
     def _cap_target_by_weight(self, vt_symbol: str, target: int, price: float) -> int:
@@ -1196,6 +1414,8 @@ class TurtleUsHkStrategy(StrategyTemplate):
 
             if diff > 0:
                 price: float = plan["price"] + self.price_add_ticks * pricetick
+                # P0-2：以 bar 收盘价作为滑点基准（不含超价）
+                self._record_order_intent(vt_symbol, plan["price"], abs(diff))
 
                 # 海龟所有开平仓都会先回到仓位0，因此只需判断开仓还是平仓
                 if pos < 0:
@@ -1208,6 +1428,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
                     continue
 
                 price = plan["price"] - self.price_add_ticks * pricetick
+                self._record_order_intent(vt_symbol, plan["price"], abs(diff))
 
                 if pos > 0:
                     self.sell(vt_symbol, price, abs(diff))
