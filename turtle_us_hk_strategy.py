@@ -316,6 +316,13 @@ class TurtleUsHkStrategy(StrategyTemplate):
     use_split_budget: bool = False       # 是否按多空分别计算单只预算
     long_budget_ratio: float = 0.5       # 多头预算占总资金比例（剩余归空头）
     # P1-16 敞口按持仓成本计算（默认不启用）：避免浮盈锁死加仓额度
+    # 警告：与「无限制做空」叠加会失控。
+    #   allow_short=True 且 max_short_* 全为 0 时，allowed_short 会退化为
+    #   「所有跌破 MA60 的标的」（向后兼容），此时再开启本参数，空头会在下跌中
+    #   不断加仓、反弹时死扛。实测（简单多空 + 成本敞口）：
+    #       214.73% / -44.83% / Sharpe 0.42 / 915 笔（无成本敞口时为 289.40% / -25.76% / 1.05 / 190 笔）
+    #   做空 + 成本敞口必须显式设置 max_short_* 并配合 MA 过滤，
+    #   例如 2多8空+MA18：397.27% / -38.79% / 0.69 / 488 笔。
     use_cost_exposure: bool = False      # 用持仓成本替代市值计算敞口
     # P1-17 ER 分位数过滤（默认不启用）：用相对排名替代固定阈值
     use_er_percentile: bool = False      # 是否用 ER 历史分位替代固定阈值
