@@ -338,12 +338,12 @@ class TurtleUsHkStrategy(StrategyTemplate):
     export_fills_daily: bool = False     # 每日收盘自动导出执行监控（覆盖写）
     fills_dir: str = ""                  # 执行监控输出目录（空=当前目录下的 output/）
     log_version_info: bool = True        # 启动时记录代码 commit 与配置指纹（版本锁定）
-    # 初始化加载天数（重要）
-    #   回测：等于「预热期天数」，引擎会跳过前 N 天不参与统计（backtesting.py:215），
-    #         改动会平移回测区间，因此必须保持 30。
-    #   实盘：等于「从数据库加载的历史天数」，必须覆盖 250 根日线（约 400 自然日），
-    #         否则 machine.inited 一直为 False，策略永不 开仓。
-    init_load_days: int = 30             # 实盘配置请设为 400
+    # 初始化加载天数
+    #   0（默认）= 自动按引擎类型选择：回测 30、实盘 400
+    #   >0       = 强制使用该值（高级用法，一般不需要）
+    # 说明：load_bars 在回测里是「预热期天数」（跳过前 N 天不计成绩），
+    #       在实盘里是「从数据库加载的历史天数」（需覆盖 250 根日线）。
+    init_load_days: int = 0
 
     # 名称列表
     parameters = [
@@ -557,10 +557,21 @@ class TurtleUsHkStrategy(StrategyTemplate):
         """初始化"""
         self.write_log("策略初始化")
 
-        # 加载历史数据天数。
-        # 回测里该值等于「预热期天数」（引擎跳过前 N 天不参与统计），保持 30 以复现基线；
-        # 实盘里该值等于「从数据库加载的天数」，需设为 400（覆盖 250 根日线）才能真正预热。
-        self.load_bars(self.init_load_days)
+        # 加载历史数据天数：按引擎类型自动选择，避免维护两份配置。
+        # 回测引擎：days 是「预热期天数」，保持 30 以复现基线（改大会平移回测区间）。
+        # 实盘引擎：days 是「从数据库加载的历史天数」，必须覆盖 250 根日线（约 400 自然日），
+        #           否则 machine.inited 一直为 False，策略不会开仓。
+        from vnpy_portfoliostrategy.backtesting import BacktestingEngine
+
+        if self.init_load_days > 0:
+            days: int = self.init_load_days
+        elif isinstance(self.strategy_engine, BacktestingEngine):
+            days = 30
+        else:
+            days = 400
+
+        self.write_log(f"初始化加载 {days} 天历史数据")
+        self.load_bars(days)
 
     def on_start(self):
         """启动"""
