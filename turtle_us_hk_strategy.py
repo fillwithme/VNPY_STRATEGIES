@@ -527,6 +527,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
         self.equity: float = float(self.capital)        # 自建权益（逐bar标记市值递推）
         self.peak_equity: float = float(self.capital)   # 权益历史峰值
         self.current_drawdown: float = 0.0              # 当前回撤（相对峰值）
+
+        # ---- 心跳观测字段（供控制面板仪表盘展示）----
+        self._daily_nav: float | None = None            # 上一交易日收盘净值（算今日盈亏）
+        self._last_tick_time: str = ""                  # 最近 tick 时间（判断行情是否中断）
         self.prev_prices: Dict[str, float] = {}         # 上一根bar收盘价（用于市值递推）
         self.pause_until: datetime | None = None        # 二级熔断暂停开仓截止时间
         self.daily_closes: Dict[str, deque] = {}        # vt_symbol -> 日收盘价序列（波动率计算）
@@ -653,15 +657,51 @@ class TurtleUsHkStrategy(StrategyTemplate):
         except OSError:
             return
 
+        # 持仓市值与敞口（用上一根 bar 收盘价估算，与权益递推口径一致）
+        holdings: Dict[str, int] = {
+            s: self.get_pos(s) for s in self.vt_symbols if self.get_pos(s)
+        }
+        market_value: float = 0.0
+        for s, pos in holdings.items():
+            price: float = self.prev_prices.get(s, 0.0)
+            market_value += abs(pos) * price
+
+        capital: float = float(self.capital) if self.capital > 0 else 0.0
+        gross: float = (market_value / capital) if capital > 0 else 0.0
+
+        # 今日盈亏（相对上一交易日收盘净值）
+        today_pnl: float = 0.0
+        if self._daily_nav is not None:
+            today_pnl = self.equity - self._daily_nav
+
+        # 成交质量
+        slips: List[float] = [r["slippage_bps"] for r in self.fill_records]
+        avg_slip: float = (sum(slips) / len(slips)) if slips else 0.0
+
         payload: dict = {
             "time": dt.isoformat(),
             "strategy": self.strategy_name,
             "breadth": round(self.market_breadth, 4),
             "max_positions": self.max_positions,
-            "positions": {
-                s: self.get_pos(s) for s in self.vt_symbols if self.get_pos(s)
-            },
+            "positions": holdings,
             "fill_count": len(self.fill_records),
+            # 账户
+            "equity": round(self.equity, 2),
+            "peak_equity": round(self.peak_equity, 2),
+            "drawdown": round(self.current_drawdown, 4),
+            "market_value": round(market_value, 2),
+            "cash": round(self.equity - market_value, 2),
+            "gross_exposure": round(gross, 4),
+            "available": round(max(0.0, 1.0 - gross), 4),
+            "today_pnl": round(today_pnl, 2),
+            "daily_nav": round(self._daily_nav, 2) if self._daily_nav else None,
+            # 执行质量
+            "avg_slippage_bps": round(avg_slip, 2),
+            "active_orders": len(self.active_orderids),
+            # 存活与状态
+            "last_tick_time": self._last_tick_time,
+            "inited": bool(self.inited),
+            "trading": bool(self.trading),
         }
 
         path = base / f"heartbeat_{self.strategy_name}.json"
@@ -852,6 +892,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
     def on_tick(self, tick: TickData):
         """Tick推送"""
         self.pbg.update_tick(tick)
+        self._last_tick_time = tick.datetime.isoformat()
 
     def on_bars(self, bars: Dict[str, BarData]):
         """原始K线推送"""
@@ -933,6 +974,9 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # P1-5：更新各标的 Efficiency Ratio
         if self.use_er_filter:
             self._update_er()
+
+        # 记录当日收盘净值（供心跳的「今日盈亏」与衰减监控使用）
+        self._daily_nav = self.equity
 
         # P0-3：每日收盘后落盘（防 IB 每日强制断线导致重启后失忆）
         if self.use_state_persist:
