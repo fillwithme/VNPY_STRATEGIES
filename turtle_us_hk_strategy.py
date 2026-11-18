@@ -898,18 +898,61 @@ class TurtleUsHkStrategy(StrategyTemplate):
         self.pbg.update_tick(tick)
         self._last_tick_time = tick.datetime.isoformat()
 
-    def _round_price(self, price: float, tick: float) -> float:
-        """把价格对齐到最小变动价位（pricetick）的整数倍
+    @staticmethod
+    def _hk_tick(price: float) -> float:
+        """港交所最小变动价位（按价格区间分段）
+
+        配置里的 pricetick 是固定值 0.01，但港交所实际是分段的：
+          0.01~0.25 -> 0.001   0.25~0.50 -> 0.005   0.50~10 -> 0.01
+          10~20     -> 0.02    20~100    -> 0.05    100~200 -> 0.10
+          200~500   -> 0.20    500~1000  -> 0.50    1000~2000 -> 1.00
+          2000~5000 -> 2.00    5000+     -> 5.00
+
+        对 29.6 的股票，合法价格必须是 0.05 的倍数（29.60/29.65/29.70）；
+        按 0.01 对齐得的 29.63 会被 IB 以 110 拒单。
+        """
+        p: float = abs(price)
+
+        if p < 0.25:
+            return 0.001
+        if p < 0.50:
+            return 0.005
+        if p < 10.0:
+            return 0.01
+        if p < 20.0:
+            return 0.02
+        if p < 100.0:
+            return 0.05
+        if p < 200.0:
+            return 0.10
+        if p < 500.0:
+            return 0.20
+        if p < 1000.0:
+            return 0.50
+        if p < 2000.0:
+            return 1.00
+        if p < 5000.0:
+            return 2.00
+        return 5.00
+
+    def _round_price(self, vt_symbol: str, price: float, tick: float) -> float:
+        """把价格对齐到最小变动价位的整数倍
 
         为什么要对齐：
           IB 的分钟线 close_price 常带 3 位小数（如 29.528）。
-          加 8 * 0.01 超价后得 29.608，IB 会以错误码 110
-          「价格不符合该合约的最小价格变动要求」拒单。
+          加 8 个 tick 超价后可能落在非法价位（29.608），
+          IB 会以错误码 110「价格不符合最小价格变动要求」拒单。
 
           被拒的委托 id 会残留在 active_orderids 里变成「幽灵委托」，
           导致后续每根 bar 都在撤销一批 IB 侧根本不存在的订单
           （错误码 10147：「未找到需要取消的OrderId」）。
+
+        注意：港交所的 tick 是分段的（见 _hk_tick），不能直接用配置的
+        固定 pricetick。这里对 SEHK 标的按价格区间取真实 tick。
         """
+        if vt_symbol.endswith(".SEHK"):
+            tick = self._hk_tick(price)
+
         if tick <= 0:
             return price
         return round(round(price / tick) * tick, 10)
@@ -1755,6 +1798,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
 
             if diff > 0:
                 price: float = self._round_price(
+                    vt_symbol,
                     plan["price"] + self.price_add_ticks * pricetick,
                     pricetick,
                 )
@@ -1772,6 +1816,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
                     continue
 
                 price = self._round_price(
+                    vt_symbol,
                     plan["price"] - self.price_add_ticks * pricetick,
                     pricetick,
                 )
