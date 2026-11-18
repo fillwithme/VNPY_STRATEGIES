@@ -142,7 +142,7 @@ import sys
 from collections import deque
 from datetime import datetime, time, timedelta
 from pathlib import Path
-from typing import Dict, List
+from typing import Callable, Dict, List
 
 import numpy as np
 
@@ -228,6 +228,21 @@ def _resolve_formula_path(raw: str) -> str:
             return str(cand.resolve())
 
     return str((Path.cwd() / raw).resolve())
+
+
+# 交易所后缀 -> 该市场的 tick 规则（策略方法名）
+# 新增市场只需在这里加一行 + 在策略类里加对应的静态方法。
+#   SEHK  港交所：11 档分段（见 _hk_tick）
+#   SMART/NASDAQ/NYSE/AMEX/ARCA/BATS  美股：$1 以上 0.01，以下 0.0001（见 _us_tick）
+_TICK_RULES: Dict[str, str] = {
+    "SEHK": "_hk_tick",
+    "SMART": "_us_tick",
+    "NASDAQ": "_us_tick",
+    "NYSE": "_us_tick",
+    "AMEX": "_us_tick",
+    "ARCA": "_us_tick",
+    "BATS": "_us_tick",
+}
 
 
 class TurtleUsHkStrategy(StrategyTemplate):
@@ -1018,23 +1033,43 @@ class TurtleUsHkStrategy(StrategyTemplate):
             return 2.00
         return 5.00
 
+    @staticmethod
+    def _us_tick(price: float) -> float:
+        """美股最小变动价位（SEC Rule 612 Sub-Penny Rule）
+
+        $1.00 及以上：0.01
+        $1.00 以下：  0.0001
+
+        美股不像港股分 11 档，只有这两档。如果沿用固定 0.01，
+        买 $1 以下的低价股会落在非法价位，被 IB 以 110 拒单。
+        """
+        if abs(price) >= 1.0:
+            return 0.01
+        return 0.0001
+
     def _round_price(self, vt_symbol: str, price: float, tick: float) -> float:
         """把价格对齐到最小变动价位的整数倍
 
         为什么要对齐：
-          IB 的分钟线 close_price 常带 3 位小数（如 29.528）。
-          加 8 个 tick 超价后可能落在非法价位（29.608），
-          IB 会以错误码 110「价格不符合最小价格变动要求」拒单。
+          IB 的分钟线 close_price 常带多位小数（如港股的 29.528，美股的 350.234）。
+          加 N 个 tick 超价后可能落在非法价位，IB 会以错误码 110
+          「价格不符合最小价格变动要求」拒单。
 
           被拒的委托 id 会残留在 active_orderids 里变成「幽灵委托」，
           导致后续每根 bar 都在撤销一批 IB 侧根本不存在的订单
           （错误码 10147：「未找到需要取消的OrderId」）。
 
-        注意：港交所的 tick 是分段的（见 _hk_tick），不能直接用配置的
-        固定 pricetick。这里对 SEHK 标的按价格区间取真实 tick。
+        规则来源：
+          按交易所后缀查 _TICK_RULES 表，取该市场的真实 tick。
+          表中没有的交易所（如期货、日本市场）回退到配置的 pricetick。
         """
-        if vt_symbol.endswith(".SEHK"):
-            tick = self._hk_tick(price)
+        exchange: str = vt_symbol.rsplit(".", 1)[-1] if "." in vt_symbol else ""
+        rule_name: str | None = _TICK_RULES.get(exchange)
+
+        if rule_name:
+            rule = getattr(self, rule_name, None)
+            if callable(rule):
+                tick = rule(price)
 
         if tick <= 0:
             return price
