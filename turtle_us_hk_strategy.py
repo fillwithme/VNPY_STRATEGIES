@@ -146,7 +146,7 @@ from typing import Dict, List
 
 import numpy as np
 
-from vnpy.trader.constant import Direction, Interval
+from vnpy.trader.constant import Direction, Interval, Status
 from vnpy.trader.object import BarData, TickData, TradeData
 
 from vnpy_portfoliostrategy import (
@@ -958,22 +958,46 @@ class TurtleUsHkStrategy(StrategyTemplate):
         return round(round(price / tick) * tick, 10)
 
     def _prune_ghost_orders(self) -> None:
-        """清理 active_orderids 里查不到对应委托的「幽灵 id」
+        """清理「幽灵」与「卡死」委托
 
-        IB 拒单（如 110）时未必触发 on_order 回调，vnpy 的
-        active_orderids 不会自动移除该 id，越积越多。
-        这里把「在本策略 orders 字典里查不到」的 id 直接剔除。
+        两类需要清理：
+          ① active_orderids 里有、但 orders 字典里查不到的（幽灵 id）
+          ② orders 里存在、但状态长期停在 SUBMITTING 的（卡死）
+
+        ② 的成因：IB 拒单（如 110 价格非法）时通过 error() 通知，
+        未必触发 on_order 回调，vnpy 的 order.status 就永远停在
+        SUBMITTING，is_active() 一直为 True，导致每根 bar 都去撤
+        一批 IB 侧根本不存在的订单（错误码 10147）。
         """
-        ghosts: List[str] = [
-            oid for oid in self.active_orderids if oid not in self.orders
-        ]
-        if not ghosts:
-            return
+        removed: int = 0
+        stuck_seconds: float = 30.0
 
-        for oid in ghosts:
-            self.active_orderids.discard(oid)
+        for oid in list(self.active_orderids):
+            order = self.orders.get(oid)
 
-        self.write_log(f"[清理] 移除 {len(ghosts)} 个幽灵委托 id（IB 侧不存在）")
+            # ① 完全查不到 → 幽灵
+            if order is None:
+                self.active_orderids.discard(oid)
+                removed += 1
+                continue
+
+            # ② 卡在 SUBMITTING 超过 30 秒 → 判定为被 IB 静默拒绝
+            try:
+                order_dt = order.datetime
+                now = (
+                    datetime.now(order_dt.tzinfo) if order_dt.tzinfo else datetime.now()
+                )
+                age: float = (now - order_dt).total_seconds()
+            except Exception:
+                age = 0.0
+
+            if order.status == Status.SUBMITTING and age > stuck_seconds:
+                self.active_orderids.discard(oid)
+                order.status = Status.REJECTED
+                removed += 1
+
+        if removed:
+            self.write_log(f"[清理] 移除 {removed} 个卡死/幽灵委托 id")
 
     def on_bars(self, bars: Dict[str, BarData]):
         """原始K线推送"""
