@@ -534,6 +534,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
         self.account_cash: float = 0.0                  # 现金余额
         self.account_available: float = 0.0             # 可用资金
 
+        # 策略基准净值：首次拿到账户数据时记录，之后持久化。
+        # 用于算「策略自启动以来的盈亏」，与账户历史盈亏区分开。
+        self._baseline_equity: float = 0.0
+
         # ---- 心跳观测字段（供控制面板仪表盘展示）----
         self._daily_nav: float | None = None            # 上一交易日收盘净值（算今日盈亏）
         self._last_tick_time: str = ""                  # 最近 tick 时间（判断行情是否中断）
@@ -750,6 +754,20 @@ class TurtleUsHkStrategy(StrategyTemplate):
             "available": round(max(0.0, 1.0 - gross), 4),
             "today_pnl": round(today_pnl, 2),
             "daily_nav": round(self._daily_nav, 2) if self._daily_nav else None,
+            # 策略累计盈亏（相对首次启动时的基准净值，不含账户历史盈亏）
+            "baseline_equity": (
+                round(self._baseline_equity, 2) if self._baseline_equity > 0 else None
+            ),
+            "strategy_pnl": (
+                round(self.equity - self._baseline_equity, 2)
+                if self._baseline_equity > 0
+                else None
+            ),
+            "strategy_pnl_pct": (
+                round(self.equity / self._baseline_equity - 1.0, 4)
+                if self._baseline_equity > 0
+                else None
+            ),
             # 执行质量
             "avg_slippage_bps": round(avg_slip, 2),
             "active_orders": len(self.active_orderids),
@@ -892,6 +910,12 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 "inited": bool(machine.inited),
             }
 
+        # 元信息（策略基准净值）：用带下划线的特殊键，加载时按标的查不到会跳过
+        data["_meta"] = {
+            "baseline_equity": float(self._baseline_equity),
+            "saved_at": datetime.now().isoformat(),
+        }
+
         try:
             path = self._state_file()
             tmp = path.with_suffix(".tmp")
@@ -923,6 +947,14 @@ class TurtleUsHkStrategy(StrategyTemplate):
         except Exception as exc:
             self.write_log(f"[state] 读取失败，按全新状态运行: {exc}")
             return
+
+        # 元信息：恢复基准净值（用于「策略累计盈亏」）
+        meta = data.pop("_meta", None)
+        if isinstance(meta, dict):
+            saved_baseline = float(meta.get("baseline_equity", 0.0) or 0.0)
+            if saved_baseline > 0:
+                self._baseline_equity = saved_baseline
+                self.write_log(f"[state] 恢复基准净值: {saved_baseline:,.2f}")
 
         restored: int = 0
         for vt_symbol, fields in data.items():
@@ -1183,6 +1215,14 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # （capital=150 万 vs 账户约 1000 万），会让净值/敞口/回撤全部失真。
         if self.account_cash > 0:
             self.equity = self._compute_equity()
+
+            # 首次拿到净值时记录基准，用于计算「策略自启动以来的盈亏」
+            if self._baseline_equity <= 0:
+                self._baseline_equity = self.equity
+                self.write_log(
+                    f"[基准] 记录策略起始净值 {self._baseline_equity:,.2f}"
+                    f"（之后的本面板「策略盈亏」以此为起点）"
+                )
 
         # 2) 峰值与当前回撤
         if self.equity > self.peak_equity:
