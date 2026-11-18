@@ -592,6 +592,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
         self.order_intents: Dict[str, int] = {}         # vt_symbol -> 累计下单股数（算成交率）
         self.fill_volumes: Dict[str, int] = {}          # vt_symbol -> 累计成交股数
 
+        # 实盘/回测标识（on_init 里按引擎类型设置）
+        # True = 实盘（做导出/心跳/持久化）；False = 回测（全部跳过，避免污染 output）
+        self.live_mode: bool = True
+
         # 实盘可观测性状态
         self._last_heartbeat_key: str = ""              # 上次心跳的分钟键（限频，避免每根 bar 写文件）
         self._alert_sent_dd: bool = False               # 回撤告警是否已发送（避免刷屏）
@@ -620,9 +624,15 @@ class TurtleUsHkStrategy(StrategyTemplate):
         #           否则 machine.inited 一直为 False，策略不会开仓。
         from vnpy_portfoliostrategy.backtesting import BacktestingEngine
 
+        # 实盘/回测自动识别：实盘才做导出、心跳、状态持久化。
+        # 这样回测和实盘可以共用同一份配置——回测不会往 output/ 里写实盘产物，
+        # 也不用再维护 production.json / production_live.json 两份几乎相同的文件。
+        is_backtest: bool = isinstance(self.strategy_engine, BacktestingEngine)
+        self.live_mode = not is_backtest
+
         if self.init_load_days > 0:
             days: int = self.init_load_days
-        elif isinstance(self.strategy_engine, BacktestingEngine):
+        elif is_backtest:
             days = 30
         else:
             days = 400
@@ -1153,7 +1163,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
         self.cancel_all()
 
         # 实盘心跳：记录最近行情时间与持仓，供控制面板判断策略是否存活
-        if self.heartbeat_enabled:
+        if self.heartbeat_enabled and self.live_mode:
             self._write_heartbeat(bar.datetime)
 
         # 应急平仓：检测到标记文件时清空目标仓位（只平仓，不开新仓）
@@ -1226,11 +1236,11 @@ class TurtleUsHkStrategy(StrategyTemplate):
         self._daily_nav = self.equity
 
         # P0-3：每日收盘后落盘（防 IB 每日强制断线导致重启后失忆）
-        if self.use_state_persist:
+        if self.use_state_persist and self.live_mode:
             self._save_state()
 
         # P0-2：每日收盘自动导出执行监控（无需人工干预）
-        if self.export_fills_daily:
+        if self.export_fills_daily and self.live_mode:
             self._auto_export_fills()
 
     def calculate_targets(self, bars: Dict[str, BarData]) -> None:
