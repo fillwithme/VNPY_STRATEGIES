@@ -900,6 +900,41 @@ class TurtleUsHkStrategy(StrategyTemplate):
         self.pbg.update_tick(tick)
         self._last_tick_time = tick.datetime.isoformat()
 
+    def _round_price(self, price: float, tick: float) -> float:
+        """把价格对齐到最小变动价位（pricetick）的整数倍
+
+        为什么要对齐：
+          IB 的分钟线 close_price 常带 3 位小数（如 29.528）。
+          加 8 * 0.01 超价后得 29.608，IB 会以错误码 110
+          「价格不符合该合约的最小价格变动要求」拒单。
+
+          被拒的委托 id 会残留在 active_orderids 里变成「幽灵委托」，
+          导致后续每根 bar 都在撤销一批 IB 侧根本不存在的订单
+          （错误码 10147：「未找到需要取消的OrderId」）。
+        """
+        if tick <= 0:
+            return price
+        return round(round(price / tick) * tick, 10)
+
+    def _prune_ghost_orders(self) -> None:
+        """清理 active_orderids 里查不到对应委托的「幽灵 id」
+
+        IB 拒单（如 110）时未必触发 on_order 回调，vnpy 的
+        active_orderids 不会自动移除该 id，越积越多。
+        这里把「在本策略 orders 字典里查不到」的 id 直接剔除。
+        """
+        ghosts: List[str] = [
+            oid for oid in self.active_orderids if oid not in self.orders
+        ]
+        if not ghosts:
+            return
+
+        for oid in ghosts:
+            self.active_orderids.discard(oid)
+            self._cancel_attempts.pop(oid, None)
+
+        self.write_log(f"[清理] 移除 {len(ghosts)} 个幽灵委托 id（IB 侧不存在）")
+
     def _cancel_all_safely(self) -> None:
         """撤掉所有活跃委托，但同一 orderid 在 60 秒内只撤一次
 
@@ -914,6 +949,9 @@ class TurtleUsHkStrategy(StrategyTemplate):
         本方法只改变「撤单的发起方式」，不改变「撤哪些单」的语义，
         因此对回测结果无影响（回测中撤单是同步即时的）。
         """
+        # 先清理幽灵 id（IB 侧不存在，撤也撤不掉，只会刷错误日志）
+        self._prune_ghost_orders()
+
         # 注意：本文件 from datetime import time，time 是 datetime.time 类，
         # 不是 time 模块，因此用 datetime.now().timestamp() 取当前时间戳。
         now: float = datetime.now().timestamp()
@@ -1760,7 +1798,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
             pricetick: float = self.get_pricetick(vt_symbol)
 
             if diff > 0:
-                price: float = plan["price"] + self.price_add_ticks * pricetick
+                price: float = self._round_price(
+                    plan["price"] + self.price_add_ticks * pricetick,
+                    pricetick,
+                )
                 # P0-2：以 bar 收盘价作为滑点基准（不含超价）
                 self._record_order_intent(vt_symbol, plan["price"], abs(diff))
 
@@ -1774,7 +1815,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 if not self.allow_short and pos <= 0:
                     continue
 
-                price = plan["price"] - self.price_add_ticks * pricetick
+                price = self._round_price(
+                    plan["price"] - self.price_add_ticks * pricetick,
+                    pricetick,
+                )
                 self._record_order_intent(vt_symbol, plan["price"], abs(diff))
 
                 if pos > 0:
