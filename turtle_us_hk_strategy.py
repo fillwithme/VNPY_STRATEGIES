@@ -147,7 +147,7 @@ from typing import Dict, List
 import numpy as np
 
 from vnpy.trader.constant import Direction, Interval, Status
-from vnpy.trader.object import BarData, TickData, TradeData
+from vnpy.trader.object import AccountData, BarData, TickData, TradeData
 
 from vnpy_portfoliostrategy import (
     StrategyEngine,
@@ -524,9 +524,15 @@ class TurtleUsHkStrategy(StrategyTemplate):
         )
 
         # ---- 组合层风控状态（P0-1 / P0-2 / P1-1）----
-        self.equity: float = float(self.capital)        # 自建权益（逐bar标记市值递推）
-        self.peak_equity: float = float(self.capital)   # 权益历史峰值
+        self.equity: float = float(self.capital)        # 组合净值（实盘优先用账户现金+持仓市值）
+        self.peak_equity: float = float(self.capital)   # 净值历史峰值
         self.current_drawdown: float = 0.0              # 当前回撤（相对峰值）
+
+        # ---- 账户资金（由 IB 通过 on_account 推送）----
+        # 注意：VeighNa 的 account.balance 装的是 IB 的 TotalCashValue（现金余额），
+        # 不是 NetLiquidation（净值）。净值 = 现金 + 持仓市值，由 _compute_equity 计算。
+        self.account_cash: float = 0.0                  # 现金余额
+        self.account_available: float = 0.0             # 可用资金
 
         # ---- 心跳观测字段（供控制面板仪表盘展示）----
         self._daily_nav: float | None = None            # 上一交易日收盘净值（算今日盈亏）
@@ -645,6 +651,44 @@ class TurtleUsHkStrategy(StrategyTemplate):
         )
         self.write_log(f"[version] params={payload}")
 
+    def on_account(self, account: AccountData) -> None:
+        """账户资金更新（IB 推送，每秒一次）
+
+        注意：VeighNa 的 account.balance 对应 IB 的 TotalCashValue（现金），
+        不是 NetLiquidation（净值）。多币种账户下更会混淆。
+        净值统一由 _compute_equity() 用「现金 + 持仓市值」计算。
+        """
+        self.account_cash = account.balance
+        self.account_available = account.available
+
+    def _compute_equity(self) -> float:
+        """组合净值 = 账户现金 + 策略持仓市值
+
+        为什么不直接用自建递推：
+          自建 equity 从 capital（配置的风险预算，150 万）起算，
+          与账户真实净值（约 1000 万）相差 6.5 倍，导致净值/敞口/回撤全部失真。
+
+        为什么不直接用 account.balance：
+          VeighNa 的「余额」是 IB 的 TotalCashValue（现金），不是净值。
+
+        口径：
+          只统计策略标的（vt_symbols），不含手工买入的非策略持仓（如 AAPL）。
+          回测中 account_cash 为 0，自动回退到自建递推的 equity。
+        """
+        cash: float = self.account_cash
+        if cash <= 0:
+            return self.equity
+
+        market_value: float = 0.0
+        for vt_symbol in self.vt_symbols:
+            pos: int = self.get_pos(vt_symbol)
+            if not pos:
+                continue
+            price: float = self.prev_prices.get(vt_symbol, 0.0)
+            market_value += abs(pos) * price
+
+        return cash + market_value
+
     def _write_heartbeat(self, dt) -> None:
         """写心跳文件（控制面板据此判断策略是否存活）
 
@@ -670,8 +714,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
             price: float = self.prev_prices.get(s, 0.0)
             market_value += abs(pos) * price
 
-        capital: float = float(self.capital) if self.capital > 0 else 0.0
-        gross: float = (market_value / capital) if capital > 0 else 0.0
+        # 敞口口径：持仓市值 / 组合净值（真实杠杆倍数）
+        # 注意不要用 capital（风险预算）当分母，那会把敞口放大 6 倍以上
+        equity: float = self.equity
+        gross: float = (market_value / equity) if equity > 0 else 0.0
 
         # 今日盈亏（相对上一交易日收盘净值）
         today_pnl: float = 0.0
@@ -694,7 +740,12 @@ class TurtleUsHkStrategy(StrategyTemplate):
             "peak_equity": round(self.peak_equity, 2),
             "drawdown": round(self.current_drawdown, 4),
             "market_value": round(market_value, 2),
-            "cash": round(self.equity - market_value, 2),
+            # 现金：实盘用 IB 推送的账户现金，回测用 equity - 市值
+            "cash": round(
+                self.account_cash if self.account_cash > 0 else (self.equity - market_value),
+                2,
+            ),
+            "available_cash": round(self.account_available, 2),
             "gross_exposure": round(gross, 4),
             "available": round(max(0.0, 1.0 - gross), 4),
             "today_pnl": round(today_pnl, 2),
@@ -1119,13 +1170,19 @@ class TurtleUsHkStrategy(StrategyTemplate):
             equity_t = equity_{t-1} + Σ pos_i × (price_t − price_{t-1})
         交易成本不在此扣除（占权益比例极小，不影响回撤阈值判定）。
         """
-        # 1) 权益递推
+        # 1) 权益递推（回测 / 账户数据未到达时使用）
         for vt_symbol, bar in bars.items():
             prev: float | None = self.prev_prices.get(vt_symbol)
             pos: int = self.get_pos(vt_symbol)
             if prev and pos:
                 self.equity += pos * (bar.close_price - prev)
             self.prev_prices[vt_symbol] = bar.close_price
+
+        # 实盘：一旦拿到账户现金，就用「现金 + 持仓市值」覆盖自建递推值。
+        # 自建递推从 capital（风险预算）起算，与账户真实净值数量级不同
+        # （capital=150 万 vs 账户约 1000 万），会让净值/敞口/回撤全部失真。
+        if self.account_cash > 0:
+            self.equity = self._compute_equity()
 
         # 2) 峰值与当前回撤
         if self.equity > self.peak_equity:
