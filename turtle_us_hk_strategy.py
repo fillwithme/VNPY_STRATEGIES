@@ -258,7 +258,12 @@ class TurtleUsHkStrategy(StrategyTemplate):
     n_window: int = 20              # N值（ATR）周期
     unit_limit: int = 4             # 最大开仓级别
     trading_size: int = 1           # 每级别交易手数
-    price_add_ticks: int = 8        # 超价 = price_add_ticks * pricetick
+    price_add_ticks: int = 8        # 超价 = price_add_ticks * pricetick（price_add_pct=0 时生效）
+    price_add_pct: float = 0.0      # 超价百分比（如 0.005 = 0.5%）；>0 时优先于 price_add_ticks
+                                    # 为什么需要它：tick 占股价的比例随价位剧烈变化——
+                                    #   港股 29.6 元，1 tick(0.05) 已是 0.17%；
+                                    #   美股 $350，1 tick(0.01) 只有 0.0029%。
+                                    # 固定 tick 数无法同时适配两个市场与不同价位。
     daily_end: str = "15:59"        # 日K合成收盘时间（交易所本地时间 HH:MM）
     allow_short: bool = True        # 是否允许做空
     lot_sizes: dict = {}            # vt_symbol -> 每手股数（港股如 {"700-HKD-STK.SEHK": 100}，缺省按 1）
@@ -378,6 +383,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
         "unit_limit",
         "trading_size",
         "price_add_ticks",
+        "price_add_pct",
         "daily_end",
         "allow_short",
         "lot_sizes",
@@ -1032,6 +1038,20 @@ class TurtleUsHkStrategy(StrategyTemplate):
         if p < 5000.0:
             return 2.00
         return 5.00
+
+    def _price_add(self, ref_price: float, pricetick: float) -> float:
+        """计算超价金额
+
+        优先用 price_add_pct（按信号价的比例）：
+          港股 29.6 元，0.005 → 0.148 元（约 3 个 tick）
+         美股 $350，0.002  → $0.70（70 个 tick）
+
+        未配置百分比时回退到 price_add_ticks（固定 tick 数）：
+          保持历史配置与回测结果不变。
+        """
+        if self.price_add_pct > 0:
+            return ref_price * self.price_add_pct
+        return self.price_add_ticks * pricetick
 
     @staticmethod
     def _us_tick(price: float) -> float:
@@ -1955,7 +1975,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
             if diff > 0:
                 price: float = self._round_price(
                     vt_symbol,
-                    plan["price"] + self.price_add_ticks * pricetick,
+                    plan["price"] + self._price_add(plan["price"], pricetick),
                     pricetick,
                 )
                 # P0-2：以 bar 收盘价作为滑点基准（不含超价）
@@ -1973,7 +1993,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
 
                 price = self._round_price(
                     vt_symbol,
-                    plan["price"] - self.price_add_ticks * pricetick,
+                    plan["price"] - self._price_add(plan["price"], pricetick),
                     pricetick,
                 )
                 self._record_order_intent(vt_symbol, plan["price"], abs(diff))
