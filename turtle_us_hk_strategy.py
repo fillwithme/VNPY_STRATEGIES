@@ -565,6 +565,12 @@ class TurtleUsHkStrategy(StrategyTemplate):
         self._last_heartbeat_key: str = ""              # 上次心跳的分钟键（限频，避免每根 bar 写文件）
         self._alert_sent_dd: bool = False               # 回撤告警是否已发送（避免刷屏）
 
+        # 撤单去重：vt_orderid -> 上次撤单时间戳
+        # IB 的撤单回执有延迟（几百毫秒到几秒）。若每根 bar 无脑 cancel_all()，
+        # 会在回执到达前把同一批 orderid 反复重发，累积成「撤单风暴」
+        # （实测一早上发出 200+ 次撤单请求，5 毫秒内集中撤销）。
+        self._cancel_attempts: Dict[str, float] = {}
+
         # P1-4 ADX 状态
         self.daily_hlc: Dict[str, deque] = {}           # vt_symbol -> (high, low, close) 序列
         self.adx_values: Dict[str, float] = {}          # vt_symbol -> 当前 ADX 值
@@ -894,6 +900,48 @@ class TurtleUsHkStrategy(StrategyTemplate):
         self.pbg.update_tick(tick)
         self._last_tick_time = tick.datetime.isoformat()
 
+    def _cancel_all_safely(self) -> None:
+        """撤掉所有活跃委托，但同一 orderid 在 60 秒内只撤一次
+
+        为什么需要去重：
+          IB 的撤单回执是异步的（几百毫秒到几秒）。原来每根 bar 都调用
+          cancel_all()，在回执到达前 active_orderids 里仍保留着这些 orderid，
+          下一根 bar 又把同一批再撤一遍，导致撤单请求指数级重复。
+
+        实测：一早上累积 200+ 个 orderid，13:24 时 5 毫秒内集中撤销，
+          触发 IB 的消息限流风险。
+
+        本方法只改变「撤单的发起方式」，不改变「撤哪些单」的语义，
+        因此对回测结果无影响（回测中撤单是同步即时的）。
+        """
+        # 注意：本文件 from datetime import time，time 是 datetime.time 类，
+        # 不是 time 模块，因此用 datetime.now().timestamp() 取当前时间戳。
+        now: float = datetime.now().timestamp()
+        cancelled: int = 0
+        skipped: int = 0
+
+        for vt_orderid in list(self.active_orderids):
+            last: float = self._cancel_attempts.get(vt_orderid, 0.0)
+            if now - last < 60:
+                skipped += 1
+                continue
+
+            self._cancel_attempts[vt_orderid] = now
+            self.cancel_order(vt_orderid)
+            cancelled += 1
+
+        if cancelled or skipped:
+            self.write_log(
+                f"[撤单] 发起 {cancelled} 个，跳过 {skipped} 个（60 秒内已撤过）"
+            )
+
+        # 防止字典无限增长：清理 5 分钟前的记录
+        if len(self._cancel_attempts) > 500:
+            cutoff: float = now - 300
+            self._cancel_attempts = {
+                k: v for k, v in self._cancel_attempts.items() if v > cutoff
+            }
+
     def on_bars(self, bars: Dict[str, BarData]):
         """原始K线推送"""
         if not bars:
@@ -902,8 +950,8 @@ class TurtleUsHkStrategy(StrategyTemplate):
         bar: BarData = list(bars.values())[0]
         self.write_log(f"{bar.datetime} - {list(bars.keys())}")
 
-        # 全撤之前委托
-        self.cancel_all()
+        # 撤掉上一轮未成交的委托（同一 orderid 60 秒内不重复撤）
+        self._cancel_all_safely()
 
         # 实盘心跳：记录最近行情时间与持仓，供控制面板判断策略是否存活
         if self.heartbeat_enabled:
