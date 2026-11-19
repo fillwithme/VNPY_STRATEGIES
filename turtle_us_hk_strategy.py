@@ -1023,11 +1023,8 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 f"price={tick.last_price} time={tick.datetime}"
             )
 
-        # 心跳改为 tick 驱动：即使 bar 合成异常，只要 IB 在推行情，
-        # 面板也能看到心跳与 last_tick_time（限频为每分钟一次）。
-        if self.heartbeat_enabled and self.live_mode:
-            self._write_heartbeat(tick.datetime)
-
+        # 心跳仍由 on_bars 写：心跳语义 = 「策略完整处理完一根 bar」。
+        # tick 计数与 last_tick_time 单独放在心跳文件里，供排查行情链路。
         self.pbg.update_tick(tick)
 
     @staticmethod
