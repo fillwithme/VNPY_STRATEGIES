@@ -362,6 +362,14 @@ class TurtleUsHkStrategy(StrategyTemplate):
     #                                      适合确认过券商持仓、准备重新对齐时使用
     check_positions_on_start: bool = True
     sync_positions_from_broker: bool = False
+
+    # 临时禁止新委托（默认关闭）：用于「同步持仓后先观察指标」的过渡期。
+    # 打开时策略仍接收行情、更新净值/心跳，但不会发送任何新委托。
+    block_new_orders: bool = False
+
+    # 重置净值基准（默认关闭）：把 baseline/peak 清空，下次有效净值重新锚定。
+    # 仅在确认历史 baseline 已被污染、且准备重新开始时临时设为 true。
+    reset_equity_baseline: bool = False
     # 实盘运维（默认关闭，不影响回测）
     export_fills_daily: bool = False     # 每日收盘自动导出执行监控（覆盖写）
     fills_dir: str = ""                  # 执行监控输出目录（空=当前目录下的 output/）
@@ -473,6 +481,8 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # 实盘启动持仓校验
         "check_positions_on_start",
         "sync_positions_from_broker",
+        "block_new_orders",
+        "reset_equity_baseline",
         # 实盘运维
         "export_fills_daily",
         "fills_dir",
@@ -561,10 +571,12 @@ class TurtleUsHkStrategy(StrategyTemplate):
         self.current_drawdown: float = 0.0              # 当前回撤（相对峰值）
 
         # ---- 账户资金（由 IB 通过 on_account 推送）----
-        # 注意：VeighNa 的 account.balance 装的是 IB 的 TotalCashValue（现金余额），
-        # 不是 NetLiquidation（净值）。净值 = 现金 + 持仓市值，由 _compute_equity 计算。
-        self.account_cash: float = 0.0                  # 现金余额
+        # 重要：vnpy_ib 把 IB 的 NetLiquidation / NetLiquidationByCurrency
+        # 映射到 account.balance，因此 account.balance 是「净值」而不是现金。
+        # 不要再把持仓市值加进去，否则会重复计算。
+        self.account_balance: float = 0.0               # 账户净值（NetLiquidation）
         self.account_available: float = 0.0             # 可用资金
+        self.account_cash: float = 0.0                  # 兼容旧字段（不再用于净值）
 
         # 策略基准净值：首次拿到账户数据时记录，之后持久化。
         # 用于算「策略自启动以来的盈亏」，与账户历史盈亏区分开。
@@ -672,6 +684,13 @@ class TurtleUsHkStrategy(StrategyTemplate):
         if self.use_state_persist:
             self._load_state()
 
+        # 一次性重置被污染的净值基准（baseline/peak）
+        if self.live_mode and self.reset_equity_baseline:
+            self._baseline_equity = 0.0
+            self.peak_equity = 0.0
+            self._equity_anchor_ready = False
+            self.write_log("[state] reset_equity_baseline=true，已清空净值基准与峰值")
+
         # 实盘启动持仓校验：不一致就禁止下单，避免按错误持仓继续交易
         if self.live_mode:
             self._verify_positions_on_start()
@@ -713,11 +732,12 @@ class TurtleUsHkStrategy(StrategyTemplate):
     def on_account(self, account: AccountData) -> None:
         """账户资金更新（IB 推送，每秒一次）
 
-        注意：VeighNa 的 account.balance 对应 IB 的 TotalCashValue（现金），
-        不是 NetLiquidation（净值）。多币种账户下更会混淆。
-        净值统一由 _compute_equity() 用「现金 + 持仓市值」计算。
+        重要：vnpy_ib 的字段映射为
+            NetLiquidation / NetLiquidationByCurrency -> balance
+        因此 account.balance 是「账户净值」，不是现金。
+        净值直接使用该字段，不能再加持仓市值。
         """
-        self.account_cash = account.balance
+        self.account_balance = account.balance
         self.account_available = account.available
 
     def _broker_net_positions(self) -> Dict[str, int]:
@@ -803,32 +823,16 @@ class TurtleUsHkStrategy(StrategyTemplate):
         )
 
     def _compute_equity(self) -> float:
-        """组合净值 = 账户现金 + 策略持仓市值
+        """组合净值：直接使用 account.balance（IB NetLiquidation）
 
-        为什么不直接用自建递推：
-          自建 equity 从 capital（配置的风险预算，150 万）起算，
-          与账户真实净值（约 1000 万）相差 6.5 倍，导致净值/敞口/回撤全部失真。
+        之前误以为 account.balance 是现金，又加上持仓市值，导致净值重复计算。
+        vnpy_ib 的映射明确是 NetLiquidation -> balance，因此这里是净值本身。
 
-        为什么不直接用 account.balance：
-          VeighNa 的「余额」是 IB 的 TotalCashValue（现金），不是净值。
-
-        口径：
-          只统计策略标的（vt_symbols），不含手工买入的非策略持仓（如 AAPL）。
-          回测中 account_cash 为 0，自动回退到自建递推的 equity。
+        回测中没有账户推送，自动回退到自建递推的 equity。
         """
-        cash: float = self.account_cash
-        if cash <= 0:
-            return self.equity
-
-        market_value: float = 0.0
-        for vt_symbol in self.vt_symbols:
-            pos: int = self.get_pos(vt_symbol)
-            if not pos:
-                continue
-            price: float = self.prev_prices.get(vt_symbol, 0.0)
-            market_value += abs(pos) * price
-
-        return cash + market_value
+        if self.account_balance > 0:
+            return self.account_balance
+        return self.equity
 
     def _write_heartbeat(self, dt) -> None:
         """写心跳文件（控制面板据此判断策略是否存活）
@@ -850,15 +854,17 @@ class TurtleUsHkStrategy(StrategyTemplate):
         holdings: Dict[str, int] = {
             s: self.get_pos(s) for s in self.vt_symbols if self.get_pos(s)
         }
-        market_value: float = 0.0
+        gross_market_value: float = 0.0     # Σ|pos|×price，敞口用
+        net_market_value: float = 0.0       # Σpos×price，估算现金用
         for s, pos in holdings.items():
             price: float = self.prev_prices.get(s, 0.0)
-            market_value += abs(pos) * price
+            gross_market_value += abs(pos) * price
+            net_market_value += pos * price
 
         # 敞口口径：持仓市值 / 组合净值（真实杠杆倍数）
         # 注意不要用 capital（风险预算）当分母，那会把敞口放大 6 倍以上
         equity: float = self.equity
-        gross: float = (market_value / equity) if equity > 0 else 0.0
+        gross: float = (gross_market_value / equity) if equity > 0 else 0.0
 
         # 今日盈亏（相对上一交易日收盘净值）
         today_pnl: float = 0.0
@@ -877,18 +883,17 @@ class TurtleUsHkStrategy(StrategyTemplate):
             "trend_filter_enabled": bool(self.use_trend_filter),
             "positions_verified": bool(self._positions_verified),
             "trading_blocked": bool(self._trading_blocked),
+            "orders_blocked": bool(self.block_new_orders),
             "positions": holdings,
             "fill_count": len(self.fill_records),
             # 账户
             "equity": round(self.equity, 2),
             "peak_equity": round(self.peak_equity, 2),
             "drawdown": round(self.current_drawdown, 4),
-            "market_value": round(market_value, 2),
-            # 现金：实盘用 IB 推送的账户现金，回测用 equity - 市值
-            "cash": round(
-                self.account_cash if self.account_cash > 0 else (self.equity - market_value),
-                2,
-            ),
+            "market_value": round(gross_market_value, 2),
+            "net_market_value": round(net_market_value, 2),
+            # 现金 ≈ 净值 − 净市值（净值来自 IB NetLiquidation）
+            "cash": round(self.equity - net_market_value, 2),
             "available_cash": round(self.account_available, 2),
             "gross_exposure": round(gross, 4),
             "available": round(max(0.0, 1.0 - gross), 4),
@@ -1286,7 +1291,9 @@ class TurtleUsHkStrategy(StrategyTemplate):
         self.cancel_all()
 
         # 实盘心跳：记录最近行情时间与持仓，供控制面板判断策略是否存活
-        if self.heartbeat_enabled and self.live_mode:
+        # 必须等策略真正启动后再写：初始化阶段会回放历史 bar，
+        # 否则会把 2026-05-20 这种历史日期写成“最新心跳”，面板误判。
+        if self.heartbeat_enabled and self.live_mode and self.trading:
             self._write_heartbeat(bar.datetime)
 
         # 应急平仓：检测到标记文件时清空目标仓位（只平仓，不开新仓）
@@ -1405,7 +1412,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # 实盘：一旦拿到账户现金，就用「现金 + 持仓市值」覆盖自建递推值。
         # 自建递推从 capital（风险预算）起算，与账户真实净值数量级不同
         # （capital=150 万 vs 账户约 1000 万），会让净值/敞口/回撤全部失真。
-        if self.account_cash > 0:
+        if self.account_balance > 0:
             self.equity = self._compute_equity()
 
             # 只有持仓与券商一致（或回测）时，才允许初始化净值锚点。
@@ -1954,6 +1961,12 @@ class TurtleUsHkStrategy(StrategyTemplate):
         if self._trading_blocked:
             if not self._block_logged:
                 self.write_log("[对账] 交易已被持仓校验拦截，不会发送任何新委托")
+                self._block_logged = True
+            return
+
+        if self.block_new_orders:
+            if not self._block_logged:
+                self.write_log("[保护] block_new_orders=true，暂停发送新委托")
                 self._block_logged = True
             return
 
