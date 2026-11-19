@@ -370,6 +370,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
     # 重置净值基准（默认关闭）：把 baseline/peak 清空，下次有效净值重新锚定。
     # 仅在确认历史 baseline 已被污染、且准备重新开始时临时设为 true。
     reset_equity_baseline: bool = False
+
+    # 实盘逐级加仓（默认开启）：每次最多增加 1 级（0.5N）。
+    # 回测保持原逻辑，避免改变基线收益与回撤。
+    live_gradual_add: bool = True
     # 实盘运维（默认关闭，不影响回测）
     export_fills_daily: bool = False     # 每日收盘自动导出执行监控（覆盖写）
     fills_dir: str = ""                  # 执行监控输出目录（空=当前目录下的 output/）
@@ -483,6 +487,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
         "sync_positions_from_broker",
         "block_new_orders",
         "reset_equity_baseline",
+        "live_gradual_add",
         # 实盘运维
         "export_fills_daily",
         "fills_dir",
@@ -662,6 +667,13 @@ class TurtleUsHkStrategy(StrategyTemplate):
         is_backtest: bool = isinstance(self.strategy_engine, BacktestingEngine)
         self.live_mode = not is_backtest
 
+        # 实盘逐级加仓：每次最多加 1 级，避免一根大阳线/跳空直接打满 4 级。
+        # 回测保持原逻辑，基线结果不变。
+        for signal in self.signals.values():
+            signal.machine.gradual_add = bool(
+                self.live_mode and self.live_gradual_add
+            )
+
         if self.init_load_days > 0:
             days: int = self.init_load_days
         elif is_backtest:
@@ -694,6 +706,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # 实盘启动持仓校验：不一致就禁止下单，避免按错误持仓继续交易
         if self.live_mode:
             self._verify_positions_on_start()
+            self._reconcile_target_state()
 
     def _log_version_info(self) -> None:
         """启动时记录代码版本与配置指纹（版本锁定）
@@ -821,6 +834,38 @@ class TurtleUsHkStrategy(StrategyTemplate):
             "[对账] 处理方式：核对券商持仓后，在配置中设置 "
             "sync_positions_from_broker=true 重启一次，或修正状态文件"
         )
+
+    def _reconcile_target_state(self) -> None:
+        """启动时修正「状态目标」与「券商持仓」的矛盾
+
+        典型事故：
+          · 状态文件恢复 target=4，但券商实际为空仓
+            -> 下一根 bar 会一次性买入 4 个 unit（不是逐级加仓）
+          · 券商是空头，状态却是 +4
+            -> 下一根 bar 会巨额买入，既平空又反手做多
+
+        处理：
+          · 空仓但状态有目标 -> 目标清零，等待新的突破信号
+          · 持仓与目标方向相反 -> 禁止下单，等待人工处理
+        """
+        for vt_symbol, signal in self.signals.items():
+            pos: int = int(self.get_pos(vt_symbol))
+            level: int = int(signal.machine.target)
+
+            if pos == 0 and level != 0:
+                signal.machine.target = 0
+                self.write_log(
+                    f"[对账] {vt_symbol} 券商空仓但状态目标={level}，"
+                    "已清零，等待新突破信号"
+                )
+                continue
+
+            if pos != 0 and level != 0 and (pos > 0) != (level > 0):
+                self._trading_blocked = True
+                self.write_log(
+                    f"[对账] {vt_symbol} 持仓方向={pos} 与状态目标={level} 相反，"
+                    "已禁止下单"
+                )
 
     def _compute_equity(self) -> float:
         """组合净值：直接使用 account.balance（IB NetLiquidation）
@@ -1978,6 +2023,14 @@ class TurtleUsHkStrategy(StrategyTemplate):
             pos: int = self.get_pos(vt_symbol)
             lot_size: int = int(self.lot_sizes.get(vt_symbol, 1)) or 1
             price: float = bar.close_price
+
+            # 方向冲突保护：持仓为多、目标为空（或反之）时不做任何操作。
+            # 正常平仓目标为 0，不受影响。
+            if pos and target and (pos > 0) != (target > 0):
+                self.write_log(
+                    f"[保护] {vt_symbol} 持仓方向({pos}) 与目标({target}) 冲突，跳过"
+                )
+                continue
 
             # 是否属于「新增敞口」方向（开仓或加仓）；平仓/减仓为 False
             if target > pos:
