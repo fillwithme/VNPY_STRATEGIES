@@ -370,10 +370,6 @@ class TurtleUsHkStrategy(StrategyTemplate):
     # 重置净值基准（默认关闭）：把 baseline/peak 清空，下次有效净值重新锚定。
     # 仅在确认历史 baseline 已被污染、且准备重新开始时临时设为 true。
     reset_equity_baseline: bool = False
-
-    # 实盘逐级加仓（默认开启）：每次最多增加 1 级（0.5N）。
-    # 回测保持原逻辑，避免改变基线收益与回撤。
-    live_gradual_add: bool = True
     # 实盘运维（默认关闭，不影响回测）
     export_fills_daily: bool = False     # 每日收盘自动导出执行监控（覆盖写）
     fills_dir: str = ""                  # 执行监控输出目录（空=当前目录下的 output/）
@@ -487,7 +483,6 @@ class TurtleUsHkStrategy(StrategyTemplate):
         "sync_positions_from_broker",
         "block_new_orders",
         "reset_equity_baseline",
-        "live_gradual_add",
         # 实盘运维
         "export_fills_daily",
         "fills_dir",
@@ -666,13 +661,6 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # 也不用再维护 production.json / production_live.json 两份几乎相同的文件。
         is_backtest: bool = isinstance(self.strategy_engine, BacktestingEngine)
         self.live_mode = not is_backtest
-
-        # 实盘逐级加仓：每次最多加 1 级，避免一根大阳线/跳空直接打满 4 级。
-        # 回测保持原逻辑，基线结果不变。
-        for signal in self.signals.values():
-            signal.machine.gradual_add = bool(
-                self.live_mode and self.live_gradual_add
-            )
 
         if self.init_load_days > 0:
             days: int = self.init_load_days
