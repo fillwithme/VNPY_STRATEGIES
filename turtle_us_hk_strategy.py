@@ -354,6 +354,14 @@ class TurtleUsHkStrategy(StrategyTemplate):
     # IB Gateway 每日 23:45 强制断开，重启后若不恢复 target/entry/n，会重复开仓或漏平仓
     use_state_persist: bool = False      # 是否在启动时恢复、每日收盘后保存状态
     state_dir: str = ""                  # 状态文件目录（空=当前工作目录下的 state/）
+
+    # 实盘启动持仓校验（默认开启）
+    # 目的：防止 state / portfolio_strategy_data 与券商实际持仓不一致时继续下单。
+    #   check_positions_on_start=False -> 不校验（不推荐）
+    #   sync_positions_from_broker=True -> 用券商持仓覆盖策略 pos_data 后继续
+    #                                      适合确认过券商持仓、准备重新对齐时使用
+    check_positions_on_start: bool = True
+    sync_positions_from_broker: bool = False
     # 实盘运维（默认关闭，不影响回测）
     export_fills_daily: bool = False     # 每日收盘自动导出执行监控（覆盖写）
     fills_dir: str = ""                  # 执行监控输出目录（空=当前目录下的 output/）
@@ -462,6 +470,9 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # P0-3 状态持久化
         "use_state_persist",
         "state_dir",
+        # 实盘启动持仓校验
+        "check_positions_on_start",
+        "sync_positions_from_broker",
         # 实盘运维
         "export_fills_daily",
         "fills_dir",
@@ -559,6 +570,13 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # 用于算「策略自启动以来的盈亏」，与账户历史盈亏区分开。
         self._baseline_equity: float = 0.0
 
+        # 净值锚点：只有确认持仓与券商一致后才初始化峰值/基准，
+        # 避免用错误持仓算出的虚高净值污染回撤与策略盈亏。
+        self._equity_anchor_ready: bool = False
+        self._positions_verified: bool = False
+        self._trading_blocked: bool = False
+        self._block_logged: bool = False
+
         # ---- 心跳观测字段（供控制面板仪表盘展示）----
         self._daily_nav: float | None = None            # 上一交易日收盘净值（算今日盈亏）
         self._last_tick_time: str = ""                  # 最近 tick 时间（判断行情是否中断）
@@ -654,6 +672,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
         if self.use_state_persist:
             self._load_state()
 
+        # 实盘启动持仓校验：不一致就禁止下单，避免按错误持仓继续交易
+        if self.live_mode:
+            self._verify_positions_on_start()
+
     def _log_version_info(self) -> None:
         """启动时记录代码版本与配置指纹（版本锁定）
 
@@ -697,6 +719,88 @@ class TurtleUsHkStrategy(StrategyTemplate):
         """
         self.account_cash = account.balance
         self.account_available = account.available
+
+    def _broker_net_positions(self) -> Dict[str, int]:
+        """读取券商净持仓（只保留本策略标的）"""
+        result: Dict[str, int] = {}
+
+        try:
+            positions = self.strategy_engine.main_engine.get_all_positions()
+        except Exception as exc:
+            self.write_log(f"[对账] 读取券商持仓失败: {exc}")
+            return result
+
+        for position in positions:
+            vt_symbol = position.vt_symbol
+            if vt_symbol not in self.vt_symbols:
+                continue
+
+            volume = int(position.volume)
+            if position.direction == Direction.SHORT:
+                volume = -volume
+
+            result[vt_symbol] = result.get(vt_symbol, 0) + volume
+
+        return result
+
+    def _verify_positions_on_start(self) -> None:
+        """启动时比对策略持仓与券商持仓
+
+        不一致时的处理：
+          · sync_positions_from_broker=True  -> 以券商为准覆盖 pos_data
+          · 否则                              -> 禁止下单（send_orders 直接返回）
+
+        这样即使 state / portfolio_strategy_data 损坏，也不会继续发错单。
+        """
+        if not self.check_positions_on_start:
+            self._positions_verified = True
+            self.write_log("[对账] 已跳过启动持仓校验（check_positions_on_start=False）")
+            return
+
+        broker: Dict[str, int] = self._broker_net_positions()
+        broker_count: int = sum(1 for v in broker.values() if v)
+
+        if self.sync_positions_from_broker:
+            self.cost_basis.clear()
+
+            for vt_symbol in self.vt_symbols:
+                volume = broker.get(vt_symbol, 0)
+                self.pos_data[vt_symbol] = volume
+                self.targets[vt_symbol] = self.targets.get(vt_symbol, 0)
+
+            self._positions_verified = True
+            self._trading_blocked = False
+            self.write_log(
+                f"[对账] 已用券商持仓覆盖策略持仓（{broker_count} 个非零标的）"
+            )
+            return
+
+        mismatches: List[tuple[str, int, int]] = []
+        for vt_symbol in self.vt_symbols:
+            strategy_volume = int(self.get_pos(vt_symbol))
+            broker_volume = broker.get(vt_symbol, 0)
+            if strategy_volume != broker_volume:
+                mismatches.append((vt_symbol, strategy_volume, broker_volume))
+
+        if not mismatches:
+            self._positions_verified = True
+            self._trading_blocked = False
+            self.write_log(f"[对账] 策略持仓与券商一致（{broker_count} 个非零标的）")
+            return
+
+        self._positions_verified = False
+        self._trading_blocked = True
+        self.write_log(
+            f"[对账] 持仓不一致，已禁止下单（{len(mismatches)} 个标的）"
+        )
+        for vt_symbol, strategy_volume, broker_volume in mismatches[:10]:
+            self.write_log(
+                f"[对账]   {vt_symbol}: 策略={strategy_volume}，券商={broker_volume}"
+            )
+        self.write_log(
+            "[对账] 处理方式：核对券商持仓后，在配置中设置 "
+            "sync_positions_from_broker=true 重启一次，或修正状态文件"
+        )
 
     def _compute_equity(self) -> float:
         """组合净值 = 账户现金 + 策略持仓市值
@@ -770,6 +874,9 @@ class TurtleUsHkStrategy(StrategyTemplate):
             "strategy": self.strategy_name,
             "breadth": round(self.market_breadth, 4),
             "max_positions": self.max_positions,
+            "trend_filter_enabled": bool(self.use_trend_filter),
+            "positions_verified": bool(self._positions_verified),
+            "trading_blocked": bool(self._trading_blocked),
             "positions": holdings,
             "fill_count": len(self.fill_records),
             # 账户
@@ -1249,14 +1356,18 @@ class TurtleUsHkStrategy(StrategyTemplate):
             self._update_er()
 
         # 记录当日收盘净值（供心跳的「今日盈亏」与衰减监控使用）
-        self._daily_nav = self.equity
+        # 必须限定「实盘 + 已启动」：初始化时会回放 400 天历史日线，
+        # 那时 equity 还是 capital，若写入会把「今日盈亏」基数变成初始资金。
+        if self.live_mode and self.trading:
+            self._daily_nav = self.equity
 
         # P0-3：每日收盘后落盘（防 IB 每日强制断线导致重启后失忆）
-        if self.use_state_persist and self.live_mode:
+        # 同样只在已启动后保存，避免初始化阶段把 baseline_equity=0 写进文件。
+        if self.use_state_persist and self.live_mode and self.trading:
             self._save_state()
 
         # P0-2：每日收盘自动导出执行监控（无需人工干预）
-        if self.export_fills_daily and self.live_mode:
+        if self.export_fills_daily and self.live_mode and self.trading:
             self._auto_export_fills()
 
     def calculate_targets(self, bars: Dict[str, BarData]) -> None:
@@ -1297,21 +1408,34 @@ class TurtleUsHkStrategy(StrategyTemplate):
         if self.account_cash > 0:
             self.equity = self._compute_equity()
 
-            # 首次拿到净值时记录基准，用于计算「策略自启动以来的盈亏」
-            if self._baseline_equity <= 0:
-                self._baseline_equity = self.equity
+            # 只有持仓与券商一致（或回测）时，才允许初始化净值锚点。
+            # 否则错误持仓算出的虚高净值会污染 peak / baseline / 回撤。
+            if not self._equity_anchor_ready and (
+                not self.live_mode or self._positions_verified
+            ):
+                self.peak_equity = self.equity
+                if self._baseline_equity <= 0:
+                    self._baseline_equity = self.equity
+                self._equity_anchor_ready = True
                 self.write_log(
-                    f"[基准] 记录策略起始净值 {self._baseline_equity:,.2f}"
-                    f"（之后的本面板「策略盈亏」以此为起点）"
+                    f"[基准] 净值锚点已初始化: equity={self.equity:,.2f} "
+                    f"peak={self.peak_equity:,.2f} "
+                    f"baseline={self._baseline_equity:,.2f}"
                 )
 
         # 2) 峰值与当前回撤
-        if self.equity > self.peak_equity:
-            self.peak_equity = self.equity
-        if self.peak_equity > 0:
-            self.current_drawdown = max(0.0, (self.peak_equity - self.equity) / self.peak_equity)
-        else:
+        if self.live_mode and not self._positions_verified:
+            # 持仓未对账：不更新峰值与回撤，避免用错误数据触发风控/告警
             self.current_drawdown = 0.0
+        else:
+            if self.equity > self.peak_equity:
+                self.peak_equity = self.equity
+            if self.peak_equity > 0:
+                self.current_drawdown = max(
+                    0.0, (self.peak_equity - self.equity) / self.peak_equity
+                )
+            else:
+                self.current_drawdown = 0.0
 
         # 回撤告警：触发一次，回落到阈值 80% 以下后重置，避免反复刷屏
         # 通知走 vnpy 的 send_notification（邮件需在全局配置里启用 SMTP）
@@ -1826,6 +1950,13 @@ class TurtleUsHkStrategy(StrategyTemplate):
 
     def send_orders(self, bars: Dict[str, BarData]) -> None:
         """发送委托（组合层风控流水线：熔断/波动率 → 单标权重 → 总敞口）"""
+        # 启动持仓校验不一致时禁止下单：只保留撤单、观察和诊断能力
+        if self._trading_blocked:
+            if not self._block_logged:
+                self.write_log("[对账] 交易已被持仓校验拦截，不会发送任何新委托")
+                self._block_logged = True
+            return
+
         plans: List[dict] = []
 
         # 阶段一：收集计划 + 新开仓缩放 + 单标权重裁剪
