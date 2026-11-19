@@ -562,6 +562,8 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # ---- 心跳观测字段（供控制面板仪表盘展示）----
         self._daily_nav: float | None = None            # 上一交易日收盘净值（算今日盈亏）
         self._last_tick_time: str = ""                  # 最近 tick 时间（判断行情是否中断）
+        self._last_bar_time: str = ""                   # 最近完成 bar 的时间
+        self._tick_count: int = 0                       # 本次运行累计 tick 数（排查行情链路）
         self.prev_prices: Dict[str, float] = {}         # 上一根bar收盘价（用于市值递推）
         self.pause_until: datetime | None = None        # 二级熔断暂停开仓截止时间
         self.daily_closes: Dict[str, deque] = {}        # vt_symbol -> 日收盘价序列（波动率计算）
@@ -804,6 +806,8 @@ class TurtleUsHkStrategy(StrategyTemplate):
             "active_orders": len(self.active_orderids),
             # 存活与状态
             "last_tick_time": self._last_tick_time,
+            "last_bar_time": self._last_bar_time,
+            "tick_count": self._tick_count,
             "inited": bool(self.inited),
             "trading": bool(self.trading),
         }
@@ -1009,8 +1013,22 @@ class TurtleUsHkStrategy(StrategyTemplate):
 
     def on_tick(self, tick: TickData):
         """Tick推送"""
-        self.pbg.update_tick(tick)
+        self._tick_count += 1
         self._last_tick_time = tick.datetime.isoformat()
+
+        # 首笔 tick 落一条日志：区分「IB 根本没推行情」与「bar 合成异常」
+        if self._tick_count == 1:
+            self.write_log(
+                f"[行情] 收到首笔 tick: {tick.vt_symbol} "
+                f"price={tick.last_price} time={tick.datetime}"
+            )
+
+        # 心跳改为 tick 驱动：即使 bar 合成异常，只要 IB 在推行情，
+        # 面板也能看到心跳与 last_tick_time（限频为每分钟一次）。
+        if self.heartbeat_enabled and self.live_mode:
+            self._write_heartbeat(tick.datetime)
+
+        self.pbg.update_tick(tick)
 
     @staticmethod
     def _hk_tick(price: float) -> float:
@@ -1153,6 +1171,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
             return
 
         bar: BarData = list(bars.values())[0]
+        self._last_bar_time = bar.datetime.isoformat()
         self.write_log(f"{bar.datetime} - {list(bars.keys())}")
 
         # 先清理幽灵 id：IB 拒单（如 110 价格非法）时未必触发 on_order，
