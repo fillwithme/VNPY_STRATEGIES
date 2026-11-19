@@ -1608,9 +1608,11 @@ class TurtleUsHkStrategy(StrategyTemplate):
         """成交回报：维护持仓成本（P1-16 敞口按成本计算用）与执行监控（P0-2）
 
         买入累加成本、卖出递减、做空则为负值，平仓后自然归零。
-        """
-        super().on_trade(trade)
 
+        注意：StrategyTemplate 没有 on_trade 方法，只有 update_trade；
+        因此不能调用 super().on_trade()。本回调由 bootstrap 的成交事件
+        转发器调用（与 update_trade 相互独立）。
+        """
         vt_symbol: str = trade.vt_symbol
         sign: float = 1.0 if trade.direction == Direction.LONG else -1.0
         self.cost_basis[vt_symbol] = (
