@@ -852,11 +852,83 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 )
                 continue
 
+            # 禁止做空的配置下，任何非零空头目标都不允许
+            if pos < 0 and not self.allow_short and level != 0:
+                self._trading_blocked = True
+                self.write_log(
+                    f"[对账] {vt_symbol} 为空头 {pos}，但 allow_short=False，"
+                    "已禁止下单"
+                )
+                continue
+
             if pos != 0 and level != 0 and (pos > 0) != (level > 0):
                 self._trading_blocked = True
                 self.write_log(
                     f"[对账] {vt_symbol} 持仓方向={pos} 与状态目标={level} 相反，"
                     "已禁止下单"
+                )
+                continue
+
+            if pos == 0 or level == 0:
+                continue
+
+            # 按实际持仓 / 单 unit 反推持有级别，避免状态 target 与实际不符时
+            # 下一根 bar 一次性补买/补卖多个 unit。
+            unit: int = signal.calculate_unit()
+            if unit <= 0:
+                self._trading_blocked = True
+                self.write_log(
+                    f"[对账] {vt_symbol} 无法计算 unit（N={signal.machine.n}），"
+                    "已禁止下单"
+                )
+                continue
+
+            raw_level: float = abs(pos) / unit
+            actual_level: int = int(round(raw_level))
+
+            # 超过最大级别：说明当前持仓本身已超出策略允许范围，
+            # 不能简单把 target 设为 actual（那会绕过 unit_limit），应拦截。
+            if raw_level > signal.machine.unit_limit + 0.25:
+                self._trading_blocked = True
+                self.write_log(
+                    f"[对账] {vt_symbol} 实际约 {raw_level:.2f} 个 unit，"
+                    f"超过上限 {signal.machine.unit_limit}，已禁止下单"
+                )
+                continue
+
+            # 非整 unit（含不足 1 个 unit）：先人工核对，避免自动平掉零碎持仓
+            if actual_level <= 0 or abs(raw_level - actual_level) > 0.25:
+                self._trading_blocked = True
+                self.write_log(
+                    f"[对账] {vt_symbol} 持仓 {pos} 不是整 unit"
+                    f"（约 {raw_level:.2f} 个），已禁止下单"
+                )
+                continue
+
+            if actual_level != abs(level):
+                actual_level = min(actual_level, signal.machine.unit_limit)
+                new_target: int = actual_level if pos > 0 else -actual_level
+                signal.machine.target = new_target
+
+                # 同步最近开仓价到反推级别，避免止损仍按旧级别计算
+                level_index: int = max(1, actual_level // signal.machine.trading_size)
+                if pos > 0:
+                    signal.machine.long_entry = (
+                        signal.machine.entry_up
+                        + signal.machine.n * (level_index - 1) * 0.5
+                    )
+                else:
+                    signal.machine.short_entry = (
+                        signal.machine.entry_down
+                        - signal.machine.n * (level_index - 1) * 0.5
+                    )
+
+                # 下一级触发价重设到当前价 ± 0.5N，禁止按历史触发价补作业
+                signal.machine.rebase_next_add = True
+                self.write_log(
+                    f"[对账] {vt_symbol} 按持仓反推级别={actual_level}"
+                    f"（unit={unit}，持仓={pos}），状态目标 {level}→{new_target}，"
+                    "下一级须从当前价再推进 0.5N"
                 )
 
     def _compute_equity(self) -> float:
@@ -2248,6 +2320,25 @@ class TurtleSignal:
         self.target: int = 0
         self.unit: int = 0
 
+    def calculate_unit(self) -> int:
+        """按当前 N 计算单级仓位股数
+
+        重启对账时也用它：用券商持仓 / unit 反推实际持有级别。
+        """
+        if not self.machine.n:
+            return 0
+
+        unit: float = (self.capital * self.risk_level) / (
+            self.machine.n * self.contract_size
+        )
+
+        # 按每手股数整手对齐，不足一手归0（美股 lot_size=1 时保底1手）
+        unit = int(unit / self.lot_size) * self.lot_size
+        if unit == 0 and self.lot_size == 1:
+            unit = 1
+
+        return int(unit)
+
     def on_bar(self, bar: BarData) -> None:
         """K线推送"""
         # 推送给状态机计算信号
@@ -2255,18 +2346,7 @@ class TurtleSignal:
 
         # 无仓位时更新unit
         if not self.target:
-            if self.machine.n:
-                unit: float = (self.capital * self.risk_level) / (
-                    self.machine.n * self.contract_size
-                )
-            else:
-                unit = 0.0
-
-            # 按每手股数整手对齐，不足一手归0（美股 lot_size=1 时保底1手）
-            unit = int(unit / self.lot_size) * self.lot_size
-            if unit == 0 and self.lot_size == 1:
-                unit = 1
-            self.unit = unit
+            self.unit = self.calculate_unit()
 
         # 获取状态机目标仓位
         self.target = int(self.machine.target * self.unit)
