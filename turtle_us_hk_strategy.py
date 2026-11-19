@@ -527,8 +527,8 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # 初始化信号字典
         self.signals: Dict[str, TurtleSignal] = {}
         for vt_symbol in vt_symbols:
-            # 合约乘数（股票为1）
-            contract_size: int = self.get_size(vt_symbol)
+            # 合约乘数（股票为1）；新池在 GUI 预加载时可能还没有合约缓存
+            contract_size: int = int(self.get_size(vt_symbol) or 1)
             # 每手股数（缺省按 1 手 = 1 股）
             lot_size: int = int(self.lot_sizes.get(vt_symbol, 1))
 
@@ -2307,11 +2307,13 @@ class TurtleSignal:
     ) -> None:
         """构造函数"""
         # 参数
+        # 新池的合约在 GUI 预加载时可能还没从 IB 查询到，get_size() 会返回 None。
+        # 股票合约乘数为 1，这里做兜底，避免 calculate_unit() 里 None * float。
         self.vt_symbol: str = vt_symbol
-        self.contract_size: int = contract_size
-        self.lot_size: int = lot_size
-        self.capital: int = capital
-        self.risk_level: float = risk_level
+        self.contract_size: int = int(contract_size or 1)
+        self.lot_size: int = max(1, int(lot_size or 1))
+        self.capital: int = int(capital or 0)
+        self.risk_level: float = float(risk_level or 0.0)
 
         # 状态机（信号逻辑迁入引擎，公式只出指标）
         self.machine = machine
@@ -2325,7 +2327,13 @@ class TurtleSignal:
 
         重启对账时也用它：用券商持仓 / unit 反推实际持有级别。
         """
-        if not self.machine.n:
+        if (
+            not self.machine.n
+            or self.machine.n <= 0
+            or self.contract_size <= 0
+            or self.capital <= 0
+            or self.risk_level <= 0
+        ):
             return 0
 
         unit: float = (self.capital * self.risk_level) / (
