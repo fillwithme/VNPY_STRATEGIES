@@ -842,9 +842,13 @@ class TurtleUsHkStrategy(StrategyTemplate):
 
             if pos == 0 and level != 0:
                 signal.machine.target = 0
+                # 仅清零还不够：如果当前价已经高于第 4 级触发价，
+                # 下一根 bar 仍会从 0 直接跳到 4。暂停当日开仓，
+                # 等下一个日 K 重新计算 entry_up / N 后再允许新信号。
+                signal.machine.traded = True
                 self.write_log(
                     f"[对账] {vt_symbol} 券商空仓但状态目标={level}，"
-                    "已清零，等待新突破信号"
+                    "已清零并暂停当日开仓，等待下一交易日重建通道"
                 )
                 continue
 
