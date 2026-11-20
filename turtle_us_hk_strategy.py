@@ -722,6 +722,11 @@ class TurtleUsHkStrategy(StrategyTemplate):
         """初始化"""
         self.write_log("策略初始化")
 
+        # 重启后用于确认加载的是“按标的独立收 bar”的新实现
+        self.write_log(
+            f"[bar] 分钟bar生成器={type(self.pbg).__name__}（按标的独立）"
+        )
+
         # 加载历史数据天数：按引擎类型自动选择，避免维护两份配置。
         # 回测引擎：days 是「预热期天数」，保持 30 以复现基线（改大会平移回测区间）。
         # 实盘引擎：days 是「从数据库加载的历史天数」，必须覆盖 250 根日线（约 400 自然日），
