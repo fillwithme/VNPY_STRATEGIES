@@ -147,8 +147,16 @@ from typing import Any, Callable, Dict, List
 
 import numpy as np
 
-from vnpy.trader.constant import Direction, Interval, Offset, Status
-from vnpy.trader.object import AccountData, BarData, OrderData, TickData, TradeData
+from vnpy.trader.constant import Direction, Exchange, Interval, Offset, Status
+from vnpy.trader.object import (
+    AccountData,
+    BarData,
+    OrderData,
+    PositionData,
+    TickData,
+    TradeData,
+)
+from vnpy.trader.utility import ZoneInfo
 
 from vnpy_portfoliostrategy import (
     StrategyEngine,
@@ -457,6 +465,17 @@ class TurtleUsHkStrategy(StrategyTemplate):
     account_id: str = ""
     base_currency: str = ""
 
+    # ---- 阶段 2：行情质量 / 时段 / 券商对账 ----
+    # 默认关闭，保证回测逐字复现；实盘配置由 validate_live_config 强制开启。
+    quote_max_age_seconds: float = 0.0        # tick 最大允许延迟秒数，0=不检查
+    price_max_jump_pct: float = 0.0           # 相对上一笔 tick 最大跳价比例，0=不检查
+    enforce_trading_session: bool = False     # 是否只允许常规交易时段 tick
+    outside_rth: bool = False                 # 是否允许盘前/盘后；同时控制 IB outsideRth
+    outside_rth_symbols: list = []            # 可选：仅这些 IB 合约允许盘外成交
+    order_tif: str = "DAY"                    # IB 订单有效期：DAY / GTC / IOC
+    market_data_fallback_seconds: float = 45.0  # 实时行情无 tick 时自动降级等待秒数
+    position_check_interval_minutes: float = 0.0  # 券商持仓周期对账间隔，0=不启用
+
     # 重置净值基准（默认关闭）：把 baseline/peak 清空，下次有效净值重新锚定。
     # 仅在确认历史 baseline 已被污染、且准备重新开始时临时设为 true。
     reset_equity_baseline: bool = False
@@ -579,6 +598,14 @@ class TurtleUsHkStrategy(StrategyTemplate):
         "max_daily_loss",
         "account_id",
         "base_currency",
+        "quote_max_age_seconds",
+        "price_max_jump_pct",
+        "enforce_trading_session",
+        "outside_rth",
+        "outside_rth_symbols",
+        "order_tif",
+        "market_data_fallback_seconds",
+        "position_check_interval_minutes",
         "reset_equity_baseline",
         # 实盘运维
         "export_fills_daily",
@@ -723,6 +750,16 @@ class TurtleUsHkStrategy(StrategyTemplate):
         self._recovery_logged: bool = False
         self._quarantine_logged: bool = False
         self._funds_logged: bool = False
+
+        # ---- 阶段 2：行情质量 / 账户过滤 / 周期对账状态 ----
+        self._broker_position_cache: Dict[str, int] = {}
+        self._broker_feed_ready: bool = False
+        self._last_position_check: datetime | None = None
+        self._positions_mismatch_logged: bool = False
+        self._account_reject_logged: bool = False
+        self._quote_reject_logged: set[str] = set()
+        self._invalid_tick_count: int = 0
+        self._last_quote_reject_reason: str = ""
 
         # ---- 心跳观测字段（供控制面板仪表盘展示）----
         self._daily_nav: float | None = None            # 上一交易日收盘净值（算今日盈亏）
@@ -890,14 +927,26 @@ class TurtleUsHkStrategy(StrategyTemplate):
 
     def _account_matches(self, account: AccountData) -> bool:
         """过滤多币种/多子账户推送，避免最后一次推送覆盖主账户净值。"""
+        gateway_name: str = getattr(account, "gateway_name", "") or ""
         accountid: str = getattr(account, "accountid", "") or ""
-        if self.account_id and self.account_id not in accountid:
-            return False
-        if self.base_currency and not accountid.upper().endswith(
+
+        matched: bool = True
+        if gateway_name and gateway_name != "IB":
+            matched = False
+        elif self.account_id and self.account_id not in accountid:
+            matched = False
+        elif self.base_currency and not accountid.upper().endswith(
             f".{self.base_currency.upper()}"
         ):
-            return False
-        return True
+            matched = False
+
+        if not matched and not self._account_reject_logged:
+            self._account_reject_logged = True
+            self.write_log(
+                f"[account] 忽略非目标账户推送: gateway={gateway_name}, "
+                f"accountid={accountid}, 期望={self.account_id}/{self.base_currency}"
+            )
+        return matched
 
     def _sync_capital_from_account(self) -> None:
         """按 IB 账户净值自动同步风险预算 capital
@@ -936,9 +985,19 @@ class TurtleUsHkStrategy(StrategyTemplate):
         )
 
     def _broker_net_positions(self) -> Dict[str, int]:
-        """读取券商净持仓（只保留本策略标的）"""
-        result: Dict[str, int] = {}
+        """读取券商净持仓（只保留本策略标的）。
 
+        优先使用 EVENT_POSITION 推送维护的缓存；缓存未就绪时退回
+        MainEngine.get_all_positions()，避免启动瞬间把「空仓」和
+        「持仓尚未推送」混为一谈。
+        """
+        if self.live_mode and self._broker_feed_ready:
+            return {
+                s: int(self._broker_position_cache.get(s, 0))
+                for s in self.vt_symbols
+            }
+
+        result: Dict[str, int] = {}
         try:
             positions = self.strategy_engine.main_engine.get_all_positions()
         except Exception as exc:
@@ -959,7 +1018,98 @@ class TurtleUsHkStrategy(StrategyTemplate):
 
             result[vt_symbol] = result.get(vt_symbol, 0) + volume
 
-        return result
+        return {s: int(result.get(s, 0)) for s in self.vt_symbols}
+
+    def on_position(self, position: PositionData) -> None:
+        """券商持仓事件：维护周期对账用的权威净持仓缓存。"""
+        if not self.live_mode:
+            return
+        if getattr(position, "gateway_name", "") not in ("", "IB"):
+            return
+        vt_symbol: str = position.vt_symbol
+        if vt_symbol not in self.vt_symbols:
+            return
+
+        volume: int = int(position.volume)
+        if position.direction == Direction.SHORT:
+            volume = -abs(volume)
+        elif position.direction == Direction.NET:
+            volume = int(position.volume)
+
+        self._broker_position_cache[vt_symbol] = volume
+        if not self._broker_feed_ready:
+            self._broker_feed_ready = True
+            self.write_log("[对账] 已收到券商持仓事件，周期对账缓存启用")
+
+    def on_broker_disconnect(self) -> None:
+        """IB 断线：清空持仓缓存，阻断新增风险，仅允许减仓/平仓。"""
+        if not self.live_mode:
+            return
+        self._broker_feed_ready = False
+        self._broker_position_cache.clear()
+        self._positions_verified = False
+        self._trading_blocked = True
+        self.close_only = True
+        self.safety_mode = "reconciliation_blocked"
+        if not getattr(self, "_broker_disconnect_logged", False):
+            self._broker_disconnect_logged = True
+            self.write_log("[对账] IB 断线，已清空持仓缓存并进入只平仓模式")
+
+    def _periodic_position_reconcile(self, dt: datetime) -> None:
+        """按配置间隔核对券商净持仓与策略 pos_data。
+
+        发现不一致时不自动覆盖本地状态，也不自动补仓/砍仓；
+        直接阻断新增风险并切换 close_only，等待人工确认。
+        """
+        if (
+            not self.live_mode
+            or not self.trading
+            or self._recovery_pending
+            or self.position_check_interval_minutes <= 0
+        ):
+            return
+
+        now: datetime = (
+            datetime.now(dt.tzinfo) if dt.tzinfo else datetime.now()
+        )
+        if self._last_position_check is not None:
+            elapsed: float = (now - self._last_position_check).total_seconds()
+            if elapsed < self.position_check_interval_minutes * 60:
+                return
+        self._last_position_check = now
+
+        # 启动对账未确认、且尚未收到任何持仓推送时，不做「空仓」判定。
+        if not self._broker_feed_ready and not self._positions_verified:
+            if not self._positions_mismatch_logged:
+                self._positions_mismatch_logged = True
+                self.write_log("[对账] 尚未收到券商持仓推送，周期对账暂缓")
+            return
+
+        broker: Dict[str, int] = self._broker_net_positions()
+        mismatches: List[tuple[str, int, int]] = []
+        for vt_symbol in self.vt_symbols:
+            local_pos: int = int(self.get_pos(vt_symbol))
+            broker_pos: int = int(broker.get(vt_symbol, 0))
+            if local_pos != broker_pos:
+                mismatches.append((vt_symbol, local_pos, broker_pos))
+
+        if not mismatches:
+            return
+
+        self._positions_verified = False
+        self._trading_blocked = True
+        self.close_only = True
+        self.safety_mode = "reconciliation_blocked"
+
+        if not self._positions_mismatch_logged:
+            self._positions_mismatch_logged = True
+            self.write_log("[对账] 券商持仓与策略本地持仓不一致，已禁止新增风险")
+            for vt_symbol, local_pos, broker_pos in mismatches[:10]:
+                self.write_log(
+                    f"[对账]   {vt_symbol}: 策略={local_pos}, 券商={broker_pos}"
+                )
+            self.write_log("[对账] 已切换 close_only；请人工核对后重启，不自动补仓")
+            self._save_state_throttled(force=True)
 
     def _verify_positions_on_start(self) -> None:
         """启动时比对策略持仓与券商持仓
@@ -1200,6 +1350,9 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 and int(i.get("remaining", 0)) > 0
             ),
             "quarantine_orders": len(self.quarantine_orderids),
+            "positions_feed_ready": bool(self._broker_feed_ready),
+            "invalid_ticks": int(self._invalid_tick_count),
+            "last_quote_reject_reason": self._last_quote_reject_reason,
             "positions": holdings,
             "fill_count": len(self.fill_records),
             # 账户
@@ -1353,6 +1506,47 @@ class TurtleUsHkStrategy(StrategyTemplate):
         base.mkdir(parents=True, exist_ok=True)
         return base / f"{self.strategy_name}.json"
 
+    def _migrate_state_v1(
+        self,
+        path: Path,
+        data: Dict[str, Any],
+        meta: dict,
+    ) -> None:
+        """把 v1 状态文件备份并升级为 schema v2。"""
+        try:
+            backup = path.with_name(
+                f"{path.name}.v1.{datetime.now().strftime('%Y%m%d%H%M%S')}.bak"
+            )
+            backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+
+            migrated: Dict[str, Any] = dict(data)
+            migrated["_meta"] = {
+                "schema_version": self.STATE_SCHEMA_VERSION,
+                "strategy_name": meta.get("strategy_name", self.strategy_name),
+                "trade_date": datetime.now().date().isoformat(),
+                "saved_at": datetime.now().isoformat(),
+                "baseline_equity": float(meta.get("baseline_equity", 0.0) or 0.0),
+            }
+            migrated["_runtime"] = {
+                "order_ledger": {},
+                "orderid_intent": {},
+                "symbol_active_intent": {},
+                "active_orderids": [],
+                "quarantine_orderids": [],
+                "intent_seq": 0,
+            }
+
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps(migrated, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+            tmp.replace(path)
+            self.write_log(f"[state] 已备份并迁移旧状态文件: {backup.name}")
+        except Exception as exc:
+            self._trading_blocked = True
+            self.write_log(f"[state] 迁移旧状态文件失败，已禁止下单: {exc}")
+
     def _save_state(self) -> None:
         """持久化状态机、订单账本、交易任务与风控锚点（schema v2）。"""
         data: Dict[str, Any] = {}
@@ -1403,6 +1597,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
             "prev_prices": self.prev_prices,
             "safety_mode": self.safety_mode,
             "funds_blocked": bool(self.funds_blocked),
+            "invalid_tick_count": int(self._invalid_tick_count),
+            "last_quote_reject_reason": self._last_quote_reject_reason,
+            "broker_feed_ready": bool(self._broker_feed_ready),
+            "positions_mismatch_logged": bool(self._positions_mismatch_logged),
         }
 
         try:
@@ -1448,16 +1646,19 @@ class TurtleUsHkStrategy(StrategyTemplate):
 
         if legacy:
             self.write_log(
-                "[state] 检测到旧版状态文件：不恢复订单账本，"
-                "同一交易日按“已交易”处理，防止重启重复开仓"
+                "[state] 检测到旧版状态文件：备份并迁移到 schema v2；"
+                "不恢复订单账本，同一交易日按“已交易”处理，防止重启重复开仓"
             )
+            self._migrate_state_v1(path, data, meta)
 
         saved_baseline: float = float(meta.get("baseline_equity", 0.0) or 0.0)
         if saved_baseline > 0:
             self._baseline_equity = saved_baseline
 
+        # v1 无法知道保存日期，按当日已交易处理，避免重启补单。
         same_day: bool = (
             meta.get("trade_date") == datetime.now().date().isoformat()
+            or legacy
         )
 
         restored: int = 0
@@ -1512,6 +1713,18 @@ class TurtleUsHkStrategy(StrategyTemplate):
             self.prev_prices = dict(runtime.get("prev_prices", {}) or {})
             self.safety_mode = str(runtime.get("safety_mode", "normal"))
             self.funds_blocked = bool(runtime.get("funds_blocked", False))
+            self._invalid_tick_count = int(
+                runtime.get("invalid_tick_count", 0) or 0
+            )
+            self._last_quote_reject_reason = str(
+                runtime.get("last_quote_reject_reason", "") or ""
+            )
+            self._broker_feed_ready = bool(
+                runtime.get("broker_feed_ready", False)
+            )
+            self._positions_mismatch_logged = bool(
+                runtime.get("positions_mismatch_logged", False)
+            )
 
             pause_until: str | None = runtime.get("pause_until")
             if pause_until:
@@ -1530,20 +1743,103 @@ class TurtleUsHkStrategy(StrategyTemplate):
             f"{len(self.order_ledger)} 个订单意图: {path}"
         )
 
+    def _reject_tick(self, tick: TickData, reason: str) -> None:
+        """记录被行情质量闸门丢弃的 tick，同原因只打一条日志避免刷屏。"""
+        self._invalid_tick_count += 1
+        self._last_quote_reject_reason = reason
+        if reason not in self._quote_reject_logged:
+            self._quote_reject_logged.add(reason)
+            self.write_log(
+                f"[行情] 丢弃异常 tick {tick.vt_symbol}: {reason}, "
+                f"price={tick.last_price}, time={tick.datetime}"
+            )
+
+    def _in_regular_session(self, tick: TickData) -> bool:
+        """按交易所本地时间判断常规交易时段（不含盘前/盘后/午休）。"""
+        dt: datetime = tick.datetime
+        is_hk: bool = (
+            tick.exchange == Exchange.SEHK or tick.vt_symbol.endswith(".SEHK")
+        )
+
+        try:
+            tz = ZoneInfo("Asia/Hong_Kong" if is_hk else "America/New_York")
+            local_dt = dt.astimezone(tz) if dt.tzinfo else dt.replace(tzinfo=tz)
+        except Exception:
+            local_dt = dt
+
+        if local_dt.weekday() >= 5:
+            return False
+
+        local_time = local_dt.time().replace(tzinfo=None)
+        if is_hk:
+            return (
+                time(9, 30) <= local_time < time(12, 0)
+                or time(13, 0) <= local_time < time(16, 0)
+            )
+        return time(9, 30) <= local_time < time(16, 0)
+
+    def _is_tick_valid(self, tick: TickData) -> bool:
+        """实盘 tick 质量闸门；回测与未启用时不拦截。"""
+        if not self.live_mode:
+            return True
+
+        price: float = float(tick.last_price or 0.0)
+        if price <= 0:
+            self._reject_tick(tick, "non_positive_price")
+            return False
+
+        dt: datetime = tick.datetime
+        if self.quote_max_age_seconds > 0:
+            now: datetime = (
+                datetime.now(dt.tzinfo) if dt.tzinfo else datetime.now()
+            )
+            age: float = (now - dt).total_seconds()
+            if age > self.quote_max_age_seconds:
+                self._reject_tick(tick, "stale_tick")
+                return False
+            if age < -30:
+                self._reject_tick(tick, "future_timestamp")
+                return False
+
+        bid: float = float(tick.bid_price_1 or 0.0)
+        ask: float = float(tick.ask_price_1 or 0.0)
+        if bid > 0 and ask > 0 and bid > ask:
+            self._reject_tick(tick, "bid_ask_crossed")
+            return False
+
+        prev_tick: TickData | None = self.pbg.last_ticks.get(tick.vt_symbol)
+        if prev_tick and prev_tick.last_price > 0 and self.price_max_jump_pct > 0:
+            jump: float = abs(price - prev_tick.last_price) / prev_tick.last_price
+            if jump > self.price_max_jump_pct:
+                self._reject_tick(tick, "price_jump")
+                return False
+
+        if (
+            self.enforce_trading_session
+            and not self.outside_rth
+            and not self._in_regular_session(tick)
+        ):
+            self._reject_tick(tick, "outside_regular_session")
+            return False
+
+        return True
+
     def on_tick(self, tick: TickData):
-        """Tick推送"""
+        """Tick推送：先过质量闸门，再合成分钟 bar。"""
+        if not self._is_tick_valid(tick):
+            return
+
         self._tick_count += 1
         self._last_tick_time = tick.datetime.isoformat()
 
-        # 首笔 tick 落一条日志：区分「IB 根本没推行情」与「bar 合成异常」
+        # 首笔有效 tick 落一条日志：区分「IB 根本没推行情」与「bar 合成异常」
         if self._tick_count == 1:
             self.write_log(
-                f"[行情] 收到首笔 tick: {tick.vt_symbol} "
+                f"[行情] 收到首笔有效 tick: {tick.vt_symbol} "
                 f"price={tick.last_price} time={tick.datetime}"
             )
 
         # 心跳仍由 on_bars 写：心跳语义 = 「策略完整处理完一根 bar」。
-        # tick 计数与 last_tick_time 单独放在心跳文件里，供排查行情链路。
         self.pbg.update_tick(tick)
 
     @staticmethod
@@ -2172,6 +2468,11 @@ class TurtleUsHkStrategy(StrategyTemplate):
         self._prune_ghost_orders()
 
         emergency: bool = self._emergency_active()
+
+        # 周期持仓对账必须在计算目标/下单之前；应急清仓时跳过，优先允许减仓。
+        if not emergency:
+            self._periodic_position_reconcile(bar.datetime)
+
         if emergency:
             self.safety_mode = "emergency_flatten"
         elif self.block_new_orders:
