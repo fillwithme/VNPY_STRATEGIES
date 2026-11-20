@@ -338,6 +338,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
     allow_short: bool = True        # 是否允许做空
     lot_sizes: dict = {}            # vt_symbol -> 每手股数（港股如 {"700-HKD-STK.SEHK": 100}，缺省按 1）
     capital: int = 10_000_000       # 风险预算基准资金（仅用于计算 unit 的名义基准，非实时净值）
+    auto_capital: bool = False      # 是否按 IB NetLiquidation 自动同步 capital（默认关闭）
     risk_level: float = 0.002       # 单笔单位仓位风险比例：1 unit 波动 1N 的亏损占 capital 的比例；
                                     # 配合 2N 止损，单 unit 最大亏损 = 2 * capital * risk_level（默认 0.2%）
     risk_levels: dict = {}          # vt_symbol -> risk_level 分档覆盖（未命中回退到 risk_level；趋势/成长股 0.004、低波动价值股 0.001）
@@ -474,6 +475,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
         "allow_short",
         "lot_sizes",
         "capital",
+        "auto_capital",
         "risk_level",
         "risk_levels",
         "json_path",
@@ -817,6 +819,44 @@ class TurtleUsHkStrategy(StrategyTemplate):
         """
         self.account_balance = account.balance
         self.account_available = account.available
+
+        self._sync_capital_from_account()
+
+    def _sync_capital_from_account(self) -> None:
+        """按 IB 账户净值自动同步风险预算 capital
+
+        仅影响之后的新开仓/加仓：
+          · TurtleSignal 持仓期间 unit 已冻结，不会被立即改写
+          · 空仓时下一根 bar 用新的 capital 重算 unit
+          · 已有持仓不会因为账户净值变化而被强制加减仓
+
+        为避免每秒账户推送导致 unit 抖动，只有变化超过 1%
+        （且至少 1,000）才更新。
+        """
+        if not self.auto_capital:
+            return
+        if self.account_balance <= 0:
+            return
+        if not hasattr(self, "signals"):
+            return
+
+        new_capital: int = int(self.account_balance)
+        if new_capital <= 0:
+            return
+
+        old_capital: int = int(self.capital)
+        threshold: int = max(1_000, int(old_capital * 0.01))
+        if old_capital > 0 and abs(new_capital - old_capital) < threshold:
+            return
+
+        self.capital = new_capital
+        for signal in self.signals.values():
+            signal.capital = new_capital
+
+        self.write_log(
+            f"[capital] auto_capital 已跟随 IB 净值: "
+            f"{old_capital:,} -> {new_capital:,}"
+        )
 
     def _broker_net_positions(self) -> Dict[str, int]:
         """读取券商净持仓（只保留本策略标的）"""
