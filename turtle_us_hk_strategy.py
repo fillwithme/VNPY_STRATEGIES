@@ -156,6 +156,76 @@ from vnpy_portfoliostrategy import (
 from vnpy_portfoliostrategy.utility import PortfolioBarGenerator
 
 
+class PerSymbolPortfolioBarGenerator(PortfolioBarGenerator):
+    """按标的独立收分钟 bar
+
+    官方实现用全局 last_dt 判断换分钟：只要任意一个标的进入新分钟，
+    就会把 bars 字典里所有标的的 bar 一起推出去。结果是同一分钟出现
+    多次不完整的 bar（每次只带部分标的），策略会重复撤单/下单。
+
+    这里改为每个标的维护自己的 last_tick_dt，只在该标的进入新分钟时
+    推送它自己的上一根 bar；不同标的互不影响。
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._last_tick_dt: Dict[str, datetime] = {}
+
+    def update_tick(self, tick: TickData) -> None:
+        if not tick.last_price:
+            return
+
+        vt_symbol: str = tick.vt_symbol
+        tick_dt: datetime = tick.datetime
+        last_dt: datetime | None = self._last_tick_dt.get(vt_symbol)
+
+        # 忽略乱序/重复的旧 tick，避免把已收的 bar 又改回去
+        if last_dt is not None and tick_dt < last_dt:
+            return
+
+        # 只在该标的自己的分钟变化时，推送它自己的上一根 bar
+        if last_dt is not None and (
+            tick_dt.replace(second=0, microsecond=0)
+            != last_dt.replace(second=0, microsecond=0)
+        ):
+            finished: BarData | None = self.bars.pop(vt_symbol, None)
+            if finished is not None:
+                finished.datetime = finished.datetime.replace(
+                    second=0, microsecond=0
+                )
+                self.on_bars({vt_symbol: finished})
+
+        bar: BarData | None = self.bars.get(vt_symbol)
+        if bar is None:
+            bar = BarData(
+                symbol=tick.symbol,
+                exchange=tick.exchange,
+                interval=Interval.MINUTE,
+                datetime=tick_dt,
+                gateway_name=tick.gateway_name,
+                open_price=tick.last_price,
+                high_price=tick.last_price,
+                low_price=tick.last_price,
+                close_price=tick.last_price,
+                open_interest=tick.open_interest,
+            )
+            self.bars[vt_symbol] = bar
+        else:
+            bar.high_price = max(bar.high_price, tick.last_price)
+            bar.low_price = min(bar.low_price, tick.last_price)
+            bar.close_price = tick.last_price
+            bar.open_interest = tick.open_interest
+            bar.datetime = tick_dt
+
+        last_tick: TickData | None = self.last_ticks.get(vt_symbol)
+        if last_tick:
+            bar.volume += max(tick.volume - last_tick.volume, 0)
+            bar.turnover += max(tick.turnover - last_tick.turnover, 0)
+
+        self.last_ticks[vt_symbol] = tick
+        self._last_tick_dt[vt_symbol] = tick_dt
+
+
 # ----------------------------------------------------------------------
 # 工具函数：定位并导入 tdx_engine（与本策略文件解耦，便于随目录迁移）
 # ----------------------------------------------------------------------
@@ -558,7 +628,9 @@ class TurtleUsHkStrategy(StrategyTemplate):
         self.targets: Dict[str, int] = {}
 
         # 初始化组合K线生成器（tick -> 分钟截面 -> 盘中日K截面）
-        self.pbg: PortfolioBarGenerator = PortfolioBarGenerator(
+        # 使用按标的独立收 bar 的版本，避免一个标的换分钟把其他标的
+        # 未完成的 bar 一起推出去（同一分钟出现多次残缺 bar）。
+        self.pbg: PortfolioBarGenerator = PerSymbolPortfolioBarGenerator(
             self.on_bars,
             on_window_bars=self.on_daily_bars,
             interval=Interval.DAILY,
@@ -1341,6 +1413,16 @@ class TurtleUsHkStrategy(StrategyTemplate):
             return price
         return round(round(price / tick) * tick, 10)
 
+    def _cancel_orders_for_bars(self, bars: Dict[str, BarData]) -> None:
+        """只撤销本次 bar 涉及标的的活动委托"""
+        if not self.active_orderids:
+            return
+
+        for vt_orderid in list(self.active_orderids):
+            order = self.orders.get(vt_orderid)
+            if order is not None and order.vt_symbol in bars:
+                self.cancel_order(vt_orderid)
+
     def _prune_ghost_orders(self) -> None:
         """清理「幽灵」与「卡死」委托
 
@@ -1396,8 +1478,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # 被拒的 id 会残留在 active_orderids 里，越积越多。
         self._prune_ghost_orders()
 
-        # 全撤之前委托
-        self.cancel_all()
+        # 只撤当前 bar 涉及标的的旧委托。
+        # 不能每根单标的 bar 都 cancel_all()：10 个标的会互相撤掉
+        # 刚发出、还未成交的委托。
+        self._cancel_orders_for_bars(bars)
 
         # 实盘心跳：记录最近行情时间与持仓，供控制面板判断策略是否存活
         # 必须等策略真正启动后再写：初始化阶段会回放历史 bar，
