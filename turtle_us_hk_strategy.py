@@ -142,7 +142,7 @@ import os
 import sys
 import uuid
 from collections import deque
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List
 
@@ -476,6 +476,11 @@ class TurtleUsHkStrategy(StrategyTemplate):
     order_tif: str = "DAY"                    # IB 订单有效期：DAY / GTC / IOC
     market_data_fallback_seconds: float = 45.0  # 实时行情无 tick 时自动降级等待秒数
     position_check_interval_minutes: float = 0.0  # 券商持仓周期对账间隔，0=不启用
+    # 数据新鲜度闸门（默认关闭，保证回测逐字复现）：
+    # 数据库缺交易日时，启动回放的历史日线会停在缺口之前，ENTRYUP 与 CCI
+    # 都基于过期通道 —— 价格一旦越过旧通道就会被误判为「突破」。
+    # 实盘建议 7（覆盖周末与短假）；滞后超过该天数时禁止新开仓。
+    max_daily_gap_days: int = 0
 
     # 重置净值基准（默认关闭）：把 baseline/peak 清空，下次有效净值重新锚定。
     # 仅在确认历史 baseline 已被污染、且准备重新开始时临时设为 true。
@@ -607,6 +612,8 @@ class TurtleUsHkStrategy(StrategyTemplate):
         "order_tif",
         "market_data_fallback_seconds",
         "position_check_interval_minutes",
+        "max_daily_gap_days",
+        "max_daily_gap_weekdays",
         "reset_equity_baseline",
         # 实盘运维
         "export_fills_daily",
@@ -757,10 +764,16 @@ class TurtleUsHkStrategy(StrategyTemplate):
         self._broker_feed_ready: bool = False
         self._last_position_check: datetime | None = None
         self._positions_mismatch_logged: bool = False
+        self._target_reconciled: bool = True             # 目标/持仓反推是否已完成（需 N 就绪）
+        self._reconcile_pending_logged: bool = False     # 「等待 N 就绪」是否已提示
         self._account_reject_logged: bool = False
         self._quote_reject_logged: set[str] = set()
         self._invalid_tick_count: int = 0
         self._last_quote_reject_reason: str = ""
+
+        # ---- 数据新鲜度状态（防止历史数据缺口导致假突破）----
+        self._last_daily_date: date | None = None       # 最近一根日K的交易日
+        self._data_stale_logged: bool = False           # 陈旧告警是否已打印
 
         # ---- 心跳观测字段（供控制面板仪表盘展示）----
         self._daily_nav: float | None = None            # 上一交易日收盘净值（算今日盈亏）
@@ -851,6 +864,12 @@ class TurtleUsHkStrategy(StrategyTemplate):
         self.write_log(f"初始化加载 {days} 天历史数据")
         self.load_bars(days)
 
+        # 兜底预热：若「分钟线 → 日线」合成链路没有触发（pbg 只按
+        # daily_end 精确匹配推送），状态机会一直是 inited=False、N=0，
+        # calculate_unit() 返回 0 —— 策略既不能开仓，也无法反推持仓级别。
+        # 这里直接从数据库分钟线合成日线补齐，幂等（已预热则跳过）。
+        self._warmup_machine_from_db(days)
+
     def on_start(self):
         """启动"""
         self.write_log("策略启动")
@@ -870,12 +889,110 @@ class TurtleUsHkStrategy(StrategyTemplate):
             self._equity_anchor_ready = False
             self.write_log("[state] reset_equity_baseline=true，已清空净值基准与峰值")
 
-        # 实盘启动持仓校验：不一致就禁止下单，避免按错误持仓继续交易
+        # 实盘启动持仓校验：不一致就禁止下单，避免按错误持仓继续交易。
+        # 目标/持仓反推必须等日线回放完成、N 有效之后再做（见
+        # _maybe_reconcile_target_state）：on_start 阶段 machine.n 还是 0，
+        # calculate_unit() 返回 0，此时反推会被判成「无法计算 unit」。
         if self.live_mode:
             self._verify_positions_on_start()
-            self._reconcile_target_state()
+            self._target_reconciled = False
         else:
             self._recovery_pending = False
+            self._target_reconciled = True
+
+    @staticmethod
+    def _aggregate_daily_bars(
+        vt_symbol: str, bars: List[BarData], keep: int = 250
+    ) -> List[BarData]:
+        """把分钟线按交易日合成日线（只保留最近 keep 根）。"""
+        groups: Dict[Any, list] = {}
+        for bar in bars:
+            day = bar.datetime.date()
+            agg = groups.get(day)
+            if agg is None:
+                groups[day] = [
+                    bar.open_price,
+                    bar.high_price,
+                    bar.low_price,
+                    bar.close_price,
+                    bar.volume,
+                    bar.turnover,
+                    bar.open_interest,
+                ]
+                continue
+            agg[1] = max(agg[1], bar.high_price)
+            agg[2] = min(agg[2], bar.low_price)
+            agg[3] = bar.close_price
+            agg[4] += bar.volume
+            agg[5] += bar.turnover
+            agg[6] = bar.open_interest
+
+        result: List[BarData] = []
+        symbol, exchange = bars[0].symbol, bars[0].exchange
+        gateway_name = bars[0].gateway_name
+        for day in sorted(groups):
+            agg = groups[day]
+            result.append(
+                BarData(
+                    symbol=symbol,
+                    exchange=exchange,
+                    datetime=datetime(day.year, day.month, day.day),
+                    interval=Interval.DAILY,
+                    volume=agg[4],
+                    turnover=agg[5],
+                    open_interest=agg[6],
+                    open_price=agg[0],
+                    high_price=agg[1],
+                    low_price=agg[2],
+                    close_price=agg[3],
+                    gateway_name=gateway_name,
+                )
+            )
+        return result[-keep:]
+
+    def _warmup_machine_from_db(self, days: int) -> None:
+        """用数据库分钟线合成日线，补齐状态机预热（幂等）。
+
+        只处理尚未 inited 的标的：正常环境由 pbg 合成日线完成预热，
+        这里仅作为兜底，避免 N=0 导致策略无法交易。
+        """
+        if not self.live_mode:
+            return
+
+        pending = [
+            (vt_symbol, signal)
+            for vt_symbol, signal in self.signals.items()
+            if not signal.machine.inited
+        ]
+        if not pending:
+            return
+
+        self.write_log(
+            f"[预热] {len(pending)} 个标的状态机未预热，用分钟线合成日线补齐"
+        )
+        for vt_symbol, signal in pending:
+            try:
+                bars = self.load_bar(vt_symbol, days, Interval.MINUTE)
+            except Exception as exc:
+                self.write_log(f"[预热] {vt_symbol} 加载分钟线失败: {exc}")
+                continue
+            if not bars:
+                continue
+
+            daily = self._aggregate_daily_bars(vt_symbol, bars)
+            for dbar in daily:
+                signal.update_daily_bar(dbar)
+
+            if daily:
+                last_day = daily[-1].datetime.date()
+                if self._last_daily_date is None or last_day > self._last_daily_date:
+                    self._last_daily_date = last_day
+
+            self.write_log(
+                f"[预热] {vt_symbol} 日线 {len(daily)} 根，"
+                f"inited={signal.machine.inited} "
+                f"N={signal.machine.n:.4f}"
+            )
 
     def _log_version_info(self) -> None:
         """启动时记录代码版本与配置指纹（版本锁定）
@@ -1172,6 +1289,48 @@ class TurtleUsHkStrategy(StrategyTemplate):
             "sync_positions_from_broker=true 重启一次，或修正状态文件"
         )
 
+    def _maybe_reconcile_target_state(self) -> None:
+        """等所有持仓标的的 N 就绪后，再做一次目标/持仓反推。
+
+        on_start 阶段日线尚未回放，machine.n = 0，calculate_unit() 返回 0；
+        若此时就反推会直接 _trading_blocked = True，导致整个交易日（含止损
+        平仓）都发不出委托。这里改为「N 有效后只做一次」。
+        """
+        if not self.live_mode or self._target_reconciled:
+            return
+
+        for vt_symbol, signal in self.signals.items():
+            if self.get_pos(vt_symbol) and signal.machine.n <= 0:
+                return
+
+        self._target_reconciled = True
+        self._reconcile_target_state()
+
+    def _block_pending_reconcile_liquidation(
+        self, vt_symbol: str, pos: int, target: int
+    ) -> bool:
+        """目标反推未完成时，禁止把 target=0 当成清仓指令。
+
+        重启后状态文件可能丢失 target（恢复为 0），而券商仍有持仓。
+        在 N 就绪、反推出真实级别之前，若按 target=0 下单会误平全部持仓。
+        返回 True 表示本标的本轮应跳过。
+        """
+        if not (
+            self.live_mode
+            and not self._target_reconciled
+            and pos != 0
+            and target == 0
+        ):
+            return False
+
+        if not self._reconcile_pending_logged:
+            self._reconcile_pending_logged = True
+            self.write_log(
+                f"[对账] {vt_symbol} 目标反推未完成（等待 N 就绪），"
+                "暂不按 target=0 清仓"
+            )
+        return True
+
     def _reconcile_target_state(self) -> None:
         """启动时修正「状态目标」与「券商持仓」的矛盾
 
@@ -1218,17 +1377,23 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 )
                 continue
 
-            if pos == 0 or level == 0:
+            # 注意：这里不能因为 level == 0 就跳过。
+            # 状态文件丢失时会出现「券商有持仓、状态 target=0」，若直接
+            # continue，下一根 bar 会把 target=0 当作「应该空仓」而卖出真实
+            # 持仓。必须走到下面的「按持仓反推级别」。
+            if pos == 0:
                 continue
 
             # 按实际持仓 / 单 unit 反推持有级别，避免状态 target 与实际不符时
             # 下一根 bar 一次性补买/补卖多个 unit。
             unit: int = signal.calculate_unit()
             if unit <= 0:
-                self._trading_blocked = True
+                # N 未算出（日线未回放完）：本轮跳过，等下一根 bar 重试。
+                # 这里绝不能 _trading_blocked = True —— 那会连带阻止止损平仓。
+                self._target_reconciled = False
                 self.write_log(
-                    f"[对账] {vt_symbol} 无法计算 unit（N={signal.machine.n}），"
-                    "已禁止下单"
+                    f"[对账] {vt_symbol} 暂无法计算 unit（N={signal.machine.n}），"
+                    "本轮跳过目标反推，等待 N 就绪"
                 )
                 continue
 
@@ -1274,6 +1439,11 @@ class TurtleUsHkStrategy(StrategyTemplate):
 
                 # 下一级触发价重设到当前价 ± 0.5N，禁止按历史触发价补作业
                 signal.machine.rebase_next_add = True
+                if level == 0:
+                    self.write_log(
+                        f"[对账] {vt_symbol} 状态目标=0 但券商持有 {pos}"
+                        "（状态文件可能丢失），已按持仓反推级别，避免误平仓"
+                    )
                 self.write_log(
                     f"[对账] {vt_symbol} 按持仓反推级别={actual_level}"
                     f"（unit={unit}，持仓={pos}），状态目标 {level}→{new_target}，"
@@ -1409,6 +1579,11 @@ class TurtleUsHkStrategy(StrategyTemplate):
             "wall_time": wall_time,
             "event_time": dt.isoformat(),
             "write_errors": int(self._heartbeat_write_errors),
+            # 数据新鲜度（供面板与健康快照判断是否因缺口而禁止开仓）
+            "last_daily_date": (
+                self._last_daily_date.isoformat() if self._last_daily_date else None
+            ),
+            "data_stale": bool(self._check_data_stale()),
         }
 
         path = base / f"heartbeat_{self.strategy_name}.json"
@@ -2498,6 +2673,8 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # 周期持仓对账必须在计算目标/下单之前；应急清仓时跳过，优先允许减仓。
         if not emergency:
             self._periodic_position_reconcile(bar.datetime)
+            # N 就绪后补做一次目标反推（重启后状态文件可能丢失 target）
+            self._maybe_reconcile_target_state()
 
         if emergency:
             self.safety_mode = "emergency_flatten"
@@ -2550,6 +2727,11 @@ class TurtleUsHkStrategy(StrategyTemplate):
         for vt_symbol, bar in bars.items():
             signal: TurtleSignal = self.signals[vt_symbol]
             signal.update_daily_bar(bar)
+
+            # 记录最近一根日K的交易日，供数据新鲜度闸门判断缺口
+            bar_date: date = bar.datetime.date()
+            if self._last_daily_date is None or bar_date > self._last_daily_date:
+                self._last_daily_date = bar_date
 
             # 记录日收盘价（P1-1 波动率 / P1-3 趋势选股 / P1-9 相对强度共用）
             dq = self.daily_closes.get(vt_symbol)
@@ -3112,8 +3294,16 @@ class TurtleUsHkStrategy(StrategyTemplate):
             return float(self.equity)
         return float(self.capital)
 
-    def _cap_target_by_weight(self, vt_symbol: str, target: int, price: float) -> int:
-        """按单标权重上限裁剪目标持仓（P0-1），仅用于新增敞口方向。"""
+    def _cap_target_by_weight(
+        self, vt_symbol: str, target: int, price: float, pos: int = 0
+    ) -> int:
+        """按单标权重上限裁剪目标持仓（P0-1），只削减新增敞口。
+
+        首次建仓（pos=0）：目标裁到权重上限；
+        加仓（pos≠0 且同向）：只限制增量，保证最终数量不超过上限，
+        但绝不减少已有持仓 —— 否则会出现「涨超限卖出、跌了再买」的
+        反复调仓（实测成交笔数放大 58 倍以上）。
+        """
         if self.max_symbol_weight <= 0 or price <= 0 or target == 0:
             return target
 
@@ -3121,10 +3311,18 @@ class TurtleUsHkStrategy(StrategyTemplate):
         cap_shares: int = int(
             (self._risk_equity() * self.max_symbol_weight) / price / lot_size
         ) * lot_size
+        cap_shares = max(0, cap_shares)
 
-        if target > 0:
-            return min(target, cap_shares)
-        return max(target, -cap_shares)
+        if abs(target) <= cap_shares:
+            return target
+
+        sign: int = 1 if target > 0 else -1
+        if pos and (pos > 0) == (target > 0):
+            # 已有同向持仓：保留现有数量，只砍掉超出上限的增量
+            capped: int = max(abs(pos), cap_shares)
+        else:
+            capped = cap_shares
+        return sign * capped
 
     def _cap_new_open_by_exposure(self, plans: List[dict], bars: Dict[str, BarData]) -> None:
         """按账户总敞口约束新增敞口（P0-1）。
@@ -3150,7 +3348,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 continue
 
             if self.use_cost_exposure:
-                value: float = abs(float(self.cost_basis.get(vt_symbol, 0.0)))
+                cost: float = abs(float(self.cost_basis.get(vt_symbol, 0.0)))
+                # cost_basis 为空（重启后成本基准丢失）时必须回退市值，
+                # 否则已用敞口被算成 0，闸门等于完全失效。
+                value: float = cost if cost else abs(pos) * price
             else:
                 value = abs(pos) * price
 
@@ -3207,6 +3408,64 @@ class TurtleUsHkStrategy(StrategyTemplate):
                     p["diff"] = 0
                 else:
                     budget -= need
+
+    @staticmethod
+    def _count_weekdays(later: date, earlier: date, limit: int = 60) -> int:
+        """统计 (earlier, later] 之间的工作日数，最多数 limit 个。"""
+        count: int = 0
+        cursor: date = later
+        while cursor > earlier and count <= limit:
+            if cursor.weekday() < 5:
+                count += 1
+            cursor -= timedelta(days=1)
+        return count
+
+    def _check_data_stale(self) -> bool:
+        """检查历史日线是否陈旧（防止数据缺口导致假突破）。
+
+        数据库缺交易日时，启动回放的历史日线会停在缺口之前，ENTRYUP 与
+        CCI 都基于过期通道 —— 价格越过旧通道就会被误判为突破。
+
+        判据分两级：
+          · 工作日缺口 > max_daily_gap_weekdays（默认 1，即最后日线必须是
+            上一个工作日）—— 精确覆盖周末与单日假期；
+          · 自然日缺口 > max_daily_gap_days —— 兜底超长缺口。
+        max_daily_gap_days = 0 表示整体关闭检查。
+        """
+        if not self.live_mode or self.max_daily_gap_days <= 0:
+            return False
+        if self._last_daily_date is None:
+            return False
+
+        today: date = datetime.now().date()
+        gap_days: int = (today - self._last_daily_date).days
+        if gap_days < 1:
+            return False
+
+        weekday_gap: int = self._count_weekdays(today, self._last_daily_date)
+        stale: bool = (
+            weekday_gap > self.max_daily_gap_weekdays
+            or gap_days > self.max_daily_gap_days
+        )
+        if not stale:
+            return False
+
+        if not self._data_stale_logged:
+            self._data_stale_logged = True
+            self.write_log(
+                f"[数据] 历史日线停在 {self._last_daily_date}"
+                f"（缺 {weekday_gap} 个工作日 / 自然日 {gap_days} 天），"
+                "已禁止新开仓；请补齐缺失的分钟线后重启策略"
+            )
+        return True
+
+    def _block_new_open_if_data_stale(self, plans: List[dict]) -> None:
+        """数据陈旧时把「新增敞口」计划清零，平仓与减仓不受影响。"""
+        if not self._check_data_stale():
+            return
+        for p in plans:
+            if p["is_open"] and p["diff"]:
+                p["diff"] = 0
 
     def _pretrade_cash_gate(self, plans: List[dict], bars: Dict[str, BarData]) -> None:
         """下单前账户可用资金 / 当日亏损保护。平仓、减仓永不拦截。"""
@@ -3299,6 +3558,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
             )
             lot_size: int = int(self.lot_sizes.get(vt_symbol, 1)) or 1
             price: float = bar.close_price
+
+            # 反推未完成前不允许把 target=0 当清仓（见 _block_pending_...）
+            if self._block_pending_reconcile_liquidation(vt_symbol, pos, target):
+                continue
 
             if close_only:
                 # 只允许减少 |pos|，不允许反向或新增敞口。
@@ -3424,11 +3687,12 @@ class TurtleUsHkStrategy(StrategyTemplate):
                         # 价格仍在均线下方 = 急跌中，不追空
                         target = pos
 
-            # 权重裁剪仅作用于首次建仓（pos==0）。
-            # 若对已持仓也裁剪，权重上限会随价格波动而变，导致「涨超限卖出、
-            # 跌额度恢复再买入」的高频反复调仓（实测成交笔数放大 58 倍以上）。
-            if is_open and pos == 0:
-                target = self._cap_target_by_weight(vt_symbol, target, price)
+            # 权重裁剪：首次建仓裁到上限；加仓只砍增量、不减少已有持仓，
+            # 避免「涨超限卖出、跌额度恢复再买入」的反复调仓。
+            if is_open and target > pos:
+                target = self._cap_target_by_weight(
+                    vt_symbol, target, price, pos
+                )
 
             # P1-8 单笔加仓金额上限：价格跳空触发多个加仓档位时，拆成多笔买入，
             # 避免在 1.5N 处一次性买满（海龟原版应在 0.5N / 1.0N / 1.5N 分批）
@@ -3472,6 +3736,9 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # 阶段二：账户级总敞口 + 可用资金 / 当日亏损门禁。
         # 两者都只削减 is_open 的 plan，平仓/减仓不受影响。
         self._cap_new_open_by_exposure(plans, bars)
+        # 数据陈旧时只允许平仓/减仓：历史日线缺口会让 ENTRYUP 过期，
+        # 价格越过旧通道会被误判为突破（2026-11-20 小米假突破即此原因）。
+        self._block_new_open_if_data_stale(plans)
         self._pretrade_cash_gate(plans, bars)
 
         # 阶段三：所有委托统一走订单账本，保证唯一意图 ID 与幂等。
