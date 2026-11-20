@@ -138,6 +138,7 @@ turtle_us_hk_strategy.py - 美股/港股通用海龟组合策略
 """
 
 import json
+import os
 import sys
 import uuid
 from collections import deque
@@ -803,6 +804,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # 实盘可观测性状态
         self._last_heartbeat_key: str = ""              # 上次心跳的分钟键（限频，避免每根 bar 写文件）
         self._alert_sent_dd: bool = False               # 回撤告警是否已发送（避免刷屏）
+        self._heartbeat_write_errors: int = 0           # 心跳写盘失败累计（阶段 3：失败可见）
 
         # 注：不做撤单去重（见 _prune_ghost_orders 的说明）。
         # 撤单风暴的根因是「价格未对齐 pricetick 被 IB 拒单 → id 残留」，
@@ -1303,7 +1305,12 @@ class TurtleUsHkStrategy(StrategyTemplate):
         base = Path(self.heartbeat_dir) if self.heartbeat_dir else Path.cwd() / "state"
         try:
             base.mkdir(parents=True, exist_ok=True)
-        except OSError:
+        except OSError as exc:
+            self._heartbeat_write_errors += 1
+            self.write_log(
+                f"[heartbeat] 创建心跳目录失败"
+                f"（累计 {self._heartbeat_write_errors} 次）: {exc}"
+            )
             return
 
         # 持仓市值与敞口（用上一根 bar 收盘价估算，与权益递推口径一致）
@@ -1330,6 +1337,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # 成交质量
         slips: List[float] = [r["slippage_bps"] for r in self.fill_records]
         avg_slip: float = (sum(slips) / len(slips)) if slips else 0.0
+
+        # 阶段 3：wall_time 取写入瞬间墙钟时间，与 bar 时间 time 区分，
+        # 供面板按新鲜度判活；字段契约见 scripts/runtime_state.py。
+        wall_time: str = datetime.now().astimezone().isoformat(timespec="seconds")
 
         payload: dict = {
             "time": dt.isoformat(),
@@ -1391,15 +1402,30 @@ class TurtleUsHkStrategy(StrategyTemplate):
             "tick_count": self._tick_count,
             "inited": bool(self.inited),
             "trading": bool(self.trading),
+            # 阶段 3：统一状态文件 schema（与 runtime_state.decorate 契约一致）
+            "schema_version": 2,
+            "writer": "strategy",
+            "pid": os.getpid(),
+            "wall_time": wall_time,
+            "event_time": dt.isoformat(),
+            "write_errors": int(self._heartbeat_write_errors),
         }
 
         path = base / f"heartbeat_{self.strategy_name}.json"
         try:
-            tmp = path.with_suffix(".tmp")
+            tmp = path.with_name(path.name + ".tmp")
             tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
             tmp.replace(path)
-        except OSError:
-            pass
+        except OSError as exc:
+            self._heartbeat_write_errors += 1
+            if (
+                self._heartbeat_write_errors == 1
+                or self._heartbeat_write_errors % 60 == 0
+            ):
+                self.write_log(
+                    f"[heartbeat] 写心跳失败"
+                    f"（累计 {self._heartbeat_write_errors} 次）: {exc}"
+                )
 
     def diagnose(self) -> str:
         """输出「为什么现在不开仓」的诊断信息（面板/日志可调用）"""
