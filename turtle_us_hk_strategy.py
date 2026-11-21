@@ -528,6 +528,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
     # 换池过渡期：遗留标的只允许减仓/平仓，禁止加仓或开新仓
     # 用途：从旧标的池切换到新池时，旧池持仓平滑退出，避免在不合适点位被迫全平
     legacy_symbols: list = []
+    # 时点股票池（研究用，默认关闭）：JSON 文件，periods=[{start,end,symbols}]。
+    # 非成员只禁止新开仓（已持仓照常离场）；市场广度与做多排名只在成员内计算。
+    # 由 scripts/pit_universe.py 生成，用于量化选股/幸存者偏差（S4-02）。
+    universe_file: str = ""
 
     # 名称列表
     parameters = [
@@ -657,7 +661,8 @@ class TurtleUsHkStrategy(StrategyTemplate):
         "heartbeat_dir",
         "alert_drawdown",
         "emergency_flatten_file",
-        "legacy_symbols"
+        "legacy_symbols",
+        "universe_file"
     ]
 
     # 不只是显示：variables 会进入引擎的 portfolio_strategy_data.json。
@@ -920,6 +925,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # 也不用再维护 production.json / production_live.json 两份几乎相同的文件。
         is_backtest: bool = isinstance(self.strategy_engine, BacktestingEngine)
         self.live_mode = not is_backtest
+        self._load_universe()
 
         if self.init_load_days > 0:
             days: int = self.init_load_days
@@ -936,6 +942,36 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # calculate_unit() 返回 0 —— 策略既不能开仓，也无法反推持仓级别。
         # 这里直接从数据库分钟线合成日线补齐，幂等（已预热则跳过）。
         self._warmup_machine_from_db(days)
+
+    def _load_universe(self) -> None:
+        """读取时点股票池（universe_file）；未配置时不限制。"""
+        self._universe_periods: List[tuple] = []
+        if not self.universe_file:
+            return
+        import json
+        from pathlib import Path
+
+        data = json.loads(Path(self.universe_file).read_text(encoding="utf-8"))
+        for period in data.get("periods", []):
+            self._universe_periods.append((
+                date.fromisoformat(period["start"]),
+                date.fromisoformat(period["end"]),
+                frozenset(period["symbols"]),
+            ))
+        self._universe_periods.sort(key=lambda p: p[0])
+        self.write_log(
+            f"[股票池] 已加载时点股票池 {len(self._universe_periods)} 期：{self.universe_file}"
+        )
+
+    def _universe_members(self, day: date | None) -> frozenset | None:
+        """day 当天的成员；未配置股票池返回 None（不限制），不在任何区间返回空集。"""
+        periods: List[tuple] = getattr(self, "_universe_periods", None) or []
+        if not periods or day is None:
+            return None
+        for start, end, symbols in periods:
+            if start <= day < end:
+                return symbols
+        return frozenset() if day >= periods[0][0] else periods[0][2]
 
     def on_start(self):
         """启动"""
@@ -1951,7 +1987,11 @@ class TurtleUsHkStrategy(StrategyTemplate):
                     "pos": pos,
                     "target_level": int(machine.target),
                     "cost_basis": round(cost, 2),
+                    # 本地成本由成交累加，重启/状态清零后会丢失，只供分析
                     "avg_cost": round(abs(cost / pos), 4) if pos else 0.0,
+                    # 成本以 IB 平均成本为准（S4-08）
+                    "broker_avg_cost": round(self._broker_avg_cost(vt_symbol), 4),
+                    "date": self._today().isoformat(),
                 }
             )
 
@@ -1964,6 +2004,8 @@ class TurtleUsHkStrategy(StrategyTemplate):
                     "target_level",
                     "cost_basis",
                     "avg_cost",
+                    "broker_avg_cost",
+                    "date",
                 ],
             )
             writer.writeheader()
@@ -2046,7 +2088,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
         return ""
 
     def _backup_state_file(self, path: Path) -> None:
-        """写盘前滚动备份上一份状态（30 分钟最多一份，保留最近 20 份）。"""
+        """写盘前滚动备份上一份状态（30 分钟最多一份，保留最近 60 份，约 4 个交易日）。
+
+        live_replay.py 按快照内的 saved_at 找「某日开盘前」的状态做当日回放对拍。
+        """
         if not path.exists():
             return
         now: datetime = datetime.now()
@@ -2059,7 +2104,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
             shutil.copy2(path, backup_dir / f"{path.stem}.{now:%Y%m%d_%H%M%S}.json")
             self._state_backup_at = now
             backups: List[Path] = sorted(backup_dir.glob(f"{path.stem}.*.json"))
-            for old in backups[:-20]:
+            for old in backups[:-60]:
                 old.unlink(missing_ok=True)
         except OSError as exc:
             self.write_log(f"[state] 备份状态文件失败（不影响本次写入）: {exc}")
@@ -2697,6 +2742,8 @@ class TurtleUsHkStrategy(StrategyTemplate):
             "offset": offset.value,
             "qty": int(volume),
             "filled": 0,
+            "order_filled": 0,       # 订单回报的累计成交（券商口径）
+            "trade_filled": 0,       # 去重后的成交回报合计
             "remaining": int(volume),
             "status": "CREATED",
             "price": float(price),
@@ -3076,7 +3123,16 @@ class TurtleUsHkStrategy(StrategyTemplate):
 
         qty: int = int(intent.get("qty", 0))
         traded: float = float(getattr(order, "traded", 0.0) or 0.0)
-        filled: int = min(qty, max(int(intent.get("filled", 0)), int(traded)))
+        # 旧状态文件恢复的意图没有分开的计数器：首次收到回报时用旧 filled 迁移一次
+        intent.setdefault("trade_filled", int(intent.get("filled", 0) or 0))
+        # 订单回报的 traded 是该委托的累计成交；成交回报另行累计到 trade_filled。
+        # 两者取大，不能相加：IB 的订单状态与成交明细先后顺序不固定，旧实现在
+        # 「先订单后成交」时把同一笔部分成交算两次，意图被提前判为 FILLED 并释放，
+        # 下一根 bar 会对剩余量重复下单（券商端原委托仍在工作）。
+        intent["order_filled"] = max(int(intent.get("order_filled", 0)), int(traded))
+        filled: int = min(
+            qty, max(int(intent["order_filled"]), int(intent.get("trade_filled", 0)))
+        )
         status_name: str = getattr(order.status, "name", str(order.status)).upper()
 
         previous_status: str = str(intent.get("status", ""))
@@ -3148,7 +3204,12 @@ class TurtleUsHkStrategy(StrategyTemplate):
             intent["tradeids"] = tradeids
 
         qty: int = int(intent.get("qty", 0))
-        filled: int = min(qty, int(intent.get("filled", 0)) + int(trade.volume))
+        # 旧状态文件恢复的意图没有分开的计数器：首次收到回报时用旧 filled 迁移一次
+        intent.setdefault("trade_filled", int(intent.get("filled", 0) or 0))
+        intent["trade_filled"] = int(intent["trade_filled"]) + int(trade.volume)
+        filled: int = min(
+            qty, max(int(intent.get("order_filled", 0)), int(intent["trade_filled"]))
+        )
         intent["filled"] = filled
         intent["remaining"] = max(0, qty - filled)
         intent["updated_at"] = datetime.now().isoformat()
@@ -3848,8 +3909,11 @@ class TurtleUsHkStrategy(StrategyTemplate):
         below: List[tuple] = []
         total: int = 0
         deviation: Dict[str, float] = {}
+        members: frozenset | None = self._universe_members(self._last_daily_date)
 
         for vt_symbol, dq in self.daily_closes.items():
+            if members is not None and vt_symbol not in members:
+                continue
             closes = list(dq)
             if len(closes) < self.trend_window + 1:
                 continue
@@ -4273,6 +4337,11 @@ class TurtleUsHkStrategy(StrategyTemplate):
             market_value: float = abs(pos) * price
             if self.use_cost_exposure:
                 cost: float = abs(float(self.cost_basis.get(vt_symbol, 0.0)))
+                if live:
+                    # 实盘成本以 IB 平均成本为准；本地累加成本重启后可能丢失或失真
+                    broker_cost: float = self._broker_avg_cost(vt_symbol)
+                    if broker_cost > 0:
+                        cost = broker_cost * abs(pos)
                 # cost_basis 为空（重启后成本基准丢失）时必须回退市值，
                 # 否则已用敞口被算成 0，闸门等于完全失效。
                 value: float = cost if cost else market_value
@@ -4634,6 +4703,12 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 elif pos == 0 and self.new_open_scale < 1.0:
                     # 一级熔断 / 高波动：仅缩减首次建仓
                     target = int(target * self.new_open_scale / lot_size) * lot_size
+
+            # 时点股票池：非成员不新开仓（已持仓按原规则离场）
+            if is_open and pos == 0 and target != 0:
+                members = self._universe_members(bar.datetime.date())
+                if members is not None and vt_symbol not in members:
+                    target = pos
 
             # P1-3 + P1-10 自适应选股：按方向检查各自的允许集合
             if is_open and pos == 0 and target != 0 and self.use_trend_filter:
