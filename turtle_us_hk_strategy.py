@@ -4342,9 +4342,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
                     broker_cost: float = self._broker_avg_cost(vt_symbol)
                     if broker_cost > 0:
                         cost = broker_cost * abs(pos)
-                # cost_basis 为空（重启后成本基准丢失）时必须回退市值，
-                # 否则已用敞口被算成 0，闸门等于完全失效。
-                value: float = cost if cost else market_value
+                # 旧写法（2026-11-22 按要求恢复）：只按 cost_basis 计，不回退市值。
+                # 回测引擎不调用 on_trade，cost_basis 恒为 0，已有持仓敞口按 0 计；
+                # 实盘下一行仍取与市值的较大者，不受影响。
+                value: float = cost
                 if live:
                     value = max(value, market_value)
             else:
@@ -4768,12 +4769,11 @@ class TurtleUsHkStrategy(StrategyTemplate):
                         # 价格仍在均线下方 = 急跌中，不追空
                         target = pos
 
-            # 权重裁剪：首次建仓裁到上限；加仓只砍增量、不减少已有持仓，
-            # 避免「涨超限卖出、跌额度恢复再买入」的反复调仓。
-            if is_open and target > pos:
-                target = self._cap_target_by_weight(
-                    vt_symbol, target, price, pos
-                )
+            # 权重裁剪仅作用于首次建仓（pos==0），加仓不受单标权重上限约束。
+            # 2026-11-22 按要求恢复 aad4641 之前的旧写法（复现 419% 基线），
+            # 影响见 README_OPTIMIZE_PLAN.md 附录 C.6。
+            if is_open and pos == 0:
+                target = self._cap_target_by_weight(vt_symbol, target, price)
 
             # P1-8 单笔加仓金额上限：价格跳空触发多个加仓档位时，拆成多笔买入，
             # 避免在 1.5N 处一次性买满（海龟原版应在 0.5N / 1.0N / 1.5N 分批）
