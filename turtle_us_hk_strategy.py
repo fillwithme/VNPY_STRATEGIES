@@ -139,6 +139,7 @@ turtle_us_hk_strategy.py - 美股/港股通用海龟组合策略
 
 import json
 import os
+import shutil
 import sys
 import uuid
 from collections import deque
@@ -167,6 +168,20 @@ from vnpy_portfoliostrategy.utility import PortfolioBarGenerator
 
 
 _TERMINAL_INTENT_STATUSES = {"FILLED", "CANCELLED", "REJECTED", "EXPIRED"}
+
+_HK_TZ = ZoneInfo("Asia/Hong_Kong")
+
+
+def _hk_calendar():
+    """港股交易日历（examples/tdx_formula/hk_calendar.py，与 tdx_engine 同目录）。
+
+    tdx_engine 导入时该目录已加入 sys.path；不可用时返回 None，调用方回退为工作日。
+    """
+    try:
+        import hk_calendar
+    except ImportError:
+        return None
+    return hk_calendar
 
 
 class PerSymbolPortfolioBarGenerator(PortfolioBarGenerator):
@@ -481,6 +496,16 @@ class TurtleUsHkStrategy(StrategyTemplate):
     # 都基于过期通道 —— 价格一旦越过旧通道就会被误判为「突破」。
     # 实盘建议 7（覆盖周末与短假）；滞后超过该天数时禁止新开仓。
     max_daily_gap_days: int = 0
+    max_daily_gap_weekdays: int = 1           # 允许的交易日缺口：1 = 最后日线必须是上一交易日
+
+    # ---- 实盘执行保护（只在实盘生效，回测逐字复现）----
+    max_orders_per_symbol_day: int = 30       # 单标的每日开仓/加仓委托上限（平仓不计），0=不限
+    max_orders_per_minute: int = 10           # 全局每分钟委托上限，0=不限
+    max_rejects_per_symbol_day: int = 3       # 单标的当日拒单达到该次数即冻结该标的，0=不限
+    max_price_deviation: float = 0.03         # 开仓限价相对最新买卖价的最大偏离，0=不检查
+    max_quote_age_for_open: float = 60.0      # 开仓要求最新有效 tick 不超过该秒数，0=不检查
+    quote_silence_seconds: float = 180.0      # 交易时段内单标的无有效 tick 超过该秒数即告警，0=不检查
+    capital_mismatch_tolerance: float = 0.2   # auto_capital=false 时 capital 与账户净值最大相对偏差，0=不检查
 
     # 重置净值基准（默认关闭）：把 baseline/peak 清空，下次有效净值重新锚定。
     # 仅在确认历史 baseline 已被污染、且准备重新开始时临时设为 true。
@@ -614,6 +639,13 @@ class TurtleUsHkStrategy(StrategyTemplate):
         "position_check_interval_minutes",
         "max_daily_gap_days",
         "max_daily_gap_weekdays",
+        "max_orders_per_symbol_day",
+        "max_orders_per_minute",
+        "max_rejects_per_symbol_day",
+        "max_price_deviation",
+        "max_quote_age_for_open",
+        "quote_silence_seconds",
+        "capital_mismatch_tolerance",
         "reset_equity_baseline",
         # 实盘运维
         "export_fills_daily",
@@ -812,7 +844,42 @@ class TurtleUsHkStrategy(StrategyTemplate):
 
         # 实盘/回测标识（on_init 里按引擎类型设置）
         # True = 实盘（做导出/心跳/持久化）；False = 回测（全部跳过，避免污染 output）
-        self.live_mode: bool = True
+        # 默认 False：on_init 之前（例如 bootstrap 的订单恢复回调先到）不得被当成
+        # 实盘去写状态文件——2026-11-20 22:01 的状态清零就是这样发生的。
+        self.live_mode: bool = False
+
+        # ---- 状态持久化保护：on_start 加载完状态之前禁止写盘 ----
+        self._state_ready: bool = False
+        self._state_guard_logged: bool = False
+        self._state_write_errors: int = 0
+        self._state_write_failed: bool = False
+        self._state_backup_at: datetime | None = None
+
+        # ---- 券商断线 / 活动委托恢复 ----
+        self._disconnect_block: bool = False
+        self._pre_disconnect: dict = {}
+        self._recovery_completed_at: datetime | None = None
+
+        # ---- 持有保护 / 执行保护 / 行情静默 ----
+        # 持有保护：对账发现持仓超级别、非整 unit、方向异常时进入——
+        # 禁止加仓、不自动减仓，状态机给出止损/离场（target=0）时照常平仓。
+        self._hold_symbols: Dict[str, str] = {}
+        self._order_counters: dict = {}               # 按交易日：下单数 / 拒单数 / 冻结标的
+        self._order_times: deque = deque()            # 最近 60 秒的发单时间
+        self._jump_pending: Dict[str, list] = {}      # 跳价待确认 [价格, 连续笔数]
+        self._last_valid_tick_wall: Dict[str, datetime] = {}
+        self._silent_symbols: set[str] = set()
+        self._capital_mismatch: bool = False
+        self._last_daily_dates: Dict[str, date] = {}  # 逐标的最近日K日期
+        self._throttle_log_at: Dict[str, datetime] = {}
+        self._eod_checked_date: str = ""
+        self._daily_finalized_date: str = ""
+        self._suppress_orders: bool = False
+        self._emergency_since: datetime | None = None
+        self._global_cancel_sent: bool = False
+        self._started_wall: datetime | None = None
+        # 外部告警钩子：bootstrap 注入 alert.send_alert(level, key, msg)
+        self.alert_hook = None
 
         # 实盘可观测性状态
         self._last_heartbeat_key: str = ""              # 上次心跳的分钟键（限频，避免每根 bar 写文件）
@@ -881,6 +948,14 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # P0-3：优先恢复上次退出时的状态机状态（防断线重启后"失忆"）
         if self.use_state_persist:
             self._load_state()
+
+        # 实盘：非持有标的的状态机回到空仓 + 最新通道（回放的模拟持仓不算数）
+        if self.live_mode:
+            self._align_unheld_machines()
+
+        # 状态已加载（或未启用持久化）：从此刻起才允许写盘
+        self._state_ready = True
+        self._started_wall = datetime.now(_HK_TZ)
 
         # 一次性重置被污染的净值基准（baseline/peak）
         if self.live_mode and self.reset_equity_baseline:
@@ -987,6 +1062,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 last_day = daily[-1].datetime.date()
                 if self._last_daily_date is None or last_day > self._last_daily_date:
                     self._last_daily_date = last_day
+                self._state_dict("_last_daily_dates")[vt_symbol] = last_day
 
             self.write_log(
                 f"[预热] {vt_symbol} 日线 {len(daily)} 根，"
@@ -1028,6 +1104,85 @@ class TurtleUsHkStrategy(StrategyTemplate):
         )
         self.write_log(f"[version] params={payload}")
 
+    # ------------------------------------------------------------------
+    # 通用小工具：惰性状态容器 / 限频日志 / 告警 / 时钟
+    # ------------------------------------------------------------------
+    def _state_dict(self, name: str) -> dict:
+        """取实例上的 dict 状态，不存在时创建（兼容 object.__new__ 构造的测试对象）。"""
+        value = self.__dict__.get(name)
+        if value is None:
+            value = {}
+            self.__dict__[name] = value
+        return value
+
+    def _state_set(self, name: str) -> set:
+        value = self.__dict__.get(name)
+        if value is None:
+            value = set()
+            self.__dict__[name] = value
+        return value
+
+    def _log_throttled(self, key: str, msg: str, seconds: float = 600.0) -> bool:
+        """同一 key 在 seconds 内只写一次日志；返回本次是否写出。"""
+        stamps: dict = self._state_dict("_throttle_log_at")
+        now: datetime = datetime.now()
+        last: datetime | None = stamps.get(key)
+        if last is not None and (now - last).total_seconds() < seconds:
+            return False
+        stamps[key] = now
+        self.write_log(msg)
+        return True
+
+    def _alert(self, level: str, key: str, msg: str) -> None:
+        """写日志并推送外部告警（level: INFO / WARN / CRIT；去重由告警模块负责）。"""
+        self.write_log(msg)
+        hook = getattr(self, "alert_hook", None)
+        if not callable(hook):
+            return
+        try:
+            hook(level, f"{getattr(self, 'strategy_name', '')}:{key}", msg)
+        except Exception as exc:
+            self.write_log(f"[告警] 推送失败: {exc}")
+
+    @staticmethod
+    def _hk_now() -> datetime:
+        return datetime.now(_HK_TZ)
+
+    def _today(self) -> date:
+        """港股交易所本地日期（测试可覆盖）。"""
+        return self._hk_now().date()
+
+    def _check_capital_consistency(self) -> None:
+        """auto_capital=false 时 capital 必须与账户净值同量级。
+
+        2026-11-20：回测配置（capital=150 万）被计划任务带进约 26 万的账户，
+        首建仓即形成 1.66 倍敞口。偏差超限时禁止新开仓（平仓不受影响）。
+        """
+        tolerance: float = float(getattr(self, "capital_mismatch_tolerance", 0.0) or 0.0)
+        if (
+            not getattr(self, "live_mode", False)
+            or getattr(self, "auto_capital", False)
+            or tolerance <= 0
+            or self.account_balance <= 0
+        ):
+            self._capital_mismatch = False
+            return
+
+        deviation: float = float(self.capital) / float(self.account_balance) - 1.0
+        mismatch: bool = abs(deviation) > tolerance
+        previous: bool = bool(getattr(self, "_capital_mismatch", False))
+        if mismatch and not previous:
+            self._alert(
+                "CRIT",
+                "capital_mismatch",
+                f"[资金] capital={float(self.capital):,.0f} 与账户净值 "
+                f"{self.account_balance:,.0f} 偏差 {deviation:+.0%}（容忍 {tolerance:.0%}），"
+                "已禁止新开仓；请开启 auto_capital 或修正 capital",
+            )
+        elif previous and not mismatch:
+            self.write_log("[资金] capital 与账户净值已恢复一致，解除开仓限制")
+        self._capital_mismatch = mismatch
+
     def on_account(self, account: AccountData) -> None:
         """账户资金更新（IB 推送，每秒一次）
 
@@ -1043,6 +1198,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
         self.account_available = account.available
 
         self._sync_capital_from_account()
+        self._check_capital_consistency()
 
     def _account_matches(self, account: AccountData) -> bool:
         """过滤多币种/多子账户推送，避免最后一次推送覆盖主账户净值。"""
@@ -1156,23 +1312,84 @@ class TurtleUsHkStrategy(StrategyTemplate):
             volume = int(position.volume)
 
         self._broker_position_cache[vt_symbol] = volume
+        self._state_dict("_broker_avg_cost_cache")[vt_symbol] = float(
+            getattr(position, "price", 0.0) or 0.0
+        )
         if not self._broker_feed_ready:
             self._broker_feed_ready = True
             self.write_log("[对账] 已收到券商持仓事件，周期对账缓存启用")
 
     def on_broker_disconnect(self) -> None:
-        """IB 断线：清空持仓缓存，阻断新增风险，仅允许减仓/平仓。"""
+        """IB 断线：清空持仓缓存，阻断新增风险，仅允许减仓/平仓。
+
+        断线前的 close_only / 拦截状态会被记住，重连且核对一致后自动还原
+        （见 _try_clear_disconnect_block），不再需要人工重启。
+        """
         if not self.live_mode:
             return
+        if not getattr(self, "_disconnect_block", False):
+            self._pre_disconnect = {
+                "close_only": bool(self.close_only),
+                "trading_blocked": bool(self._trading_blocked),
+            }
+            self._disconnect_block = True
+            self._alert(
+                "WARN",
+                "ib_disconnect",
+                "[对账] IB 断线，已清空持仓缓存并进入只平仓模式；"
+                "重连、活动委托恢复且持仓核对一致后自动恢复",
+            )
         self._broker_feed_ready = False
         self._broker_position_cache.clear()
         self._positions_verified = False
         self._trading_blocked = True
         self.close_only = True
         self.safety_mode = "reconciliation_blocked"
-        if not getattr(self, "_broker_disconnect_logged", False):
-            self._broker_disconnect_logged = True
-            self.write_log("[对账] IB 断线，已清空持仓缓存并进入只平仓模式")
+        # 断线期间券商侧委托可能已变化：重连后必须重新恢复活动委托再发单
+        self._recovery_pending = True
+        self._recovery_logged = False
+
+    def _try_clear_disconnect_block(self) -> None:
+        """重连 + 活动委托恢复完成 + 持仓核对一致后，自动解除断线保护。"""
+        if not (getattr(self, "live_mode", False) and getattr(self, "_disconnect_block", False)):
+            return
+        if self._recovery_pending:
+            return
+        done_at: datetime | None = getattr(self, "_recovery_completed_at", None)
+        if done_at is None:
+            return
+        # 空仓账户不会收到持仓推送：持仓事件未到时，恢复完成 90 秒后改用主引擎缓存核对
+        if not self._broker_feed_ready and (datetime.now() - done_at).total_seconds() < 90:
+            return
+
+        broker: Dict[str, int] = self._broker_net_positions()
+        mismatches: List[tuple[str, int, int]] = []
+        for vt_symbol in self.vt_symbols:
+            local_pos: int = int(self.get_pos(vt_symbol))
+            broker_pos: int = int(broker.get(vt_symbol, 0))
+            if local_pos != broker_pos:
+                mismatches.append((vt_symbol, local_pos, broker_pos))
+
+        self._disconnect_block = False
+        if mismatches:
+            detail: str = "；".join(f"{s}: 策略={lp}, 券商={bp}" for s, lp, bp in mismatches[:5])
+            self._alert(
+                "CRIT",
+                "reconnect_mismatch",
+                f"[对账] IB 重连后持仓不一致（{detail}），保持只平仓模式，请人工核对后重启",
+            )
+            return
+
+        previous: dict = getattr(self, "_pre_disconnect", {}) or {}
+        self.close_only = bool(previous.get("close_only", False))
+        self._trading_blocked = bool(previous.get("trading_blocked", False))
+        self._positions_verified = True
+        self._positions_mismatch_logged = False
+        self._alert(
+            "INFO",
+            "ib_reconnect",
+            "[对账] IB 已重连，活动委托恢复完成且持仓一致，已自动解除断线只平仓模式",
+        )
 
     def _periodic_position_reconcile(self, dt: datetime) -> None:
         """按配置间隔核对券商净持仓与策略 pos_data。
@@ -1185,6 +1402,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
             or not self.trading
             or self._recovery_pending
             or self.position_check_interval_minutes <= 0
+            or getattr(self, "_disconnect_block", False)
         ):
             return
 
@@ -1207,6 +1425,9 @@ class TurtleUsHkStrategy(StrategyTemplate):
         broker: Dict[str, int] = self._broker_net_positions()
         mismatches: List[tuple[str, int, int]] = []
         for vt_symbol in self.vt_symbols:
+            # 有在途委托的标的：成交回报与持仓推送存在时间差，留到下一轮再比
+            if self._active_intent_for_symbol(vt_symbol) is not None:
+                continue
             local_pos: int = int(self.get_pos(vt_symbol))
             broker_pos: int = int(broker.get(vt_symbol, 0))
             if local_pos != broker_pos:
@@ -1222,7 +1443,11 @@ class TurtleUsHkStrategy(StrategyTemplate):
 
         if not self._positions_mismatch_logged:
             self._positions_mismatch_logged = True
-            self.write_log("[对账] 券商持仓与策略本地持仓不一致，已禁止新增风险")
+            self._alert(
+                "CRIT",
+                "position_mismatch",
+                "[对账] 券商持仓与策略本地持仓不一致，已禁止新增风险（止损/离场照常）",
+            )
             for vt_symbol, local_pos, broker_pos in mismatches[:10]:
                 self.write_log(
                     f"[对账]   {vt_symbol}: 策略={local_pos}, 券商={broker_pos}"
@@ -1277,8 +1502,11 @@ class TurtleUsHkStrategy(StrategyTemplate):
 
         self._positions_verified = False
         self._trading_blocked = True
-        self.write_log(
-            f"[对账] 持仓不一致，已禁止下单（{len(mismatches)} 个标的）"
+        self._alert(
+            "CRIT",
+            "start_mismatch",
+            f"[对账] 启动持仓不一致（{len(mismatches)} 个标的），已禁止开仓/加仓，"
+            "止损/离场按券商持仓照常执行",
         )
         for vt_symbol, strategy_volume, broker_volume in mismatches[:10]:
             self.write_log(
@@ -1299,12 +1527,28 @@ class TurtleUsHkStrategy(StrategyTemplate):
         if not self.live_mode or self._target_reconciled:
             return
 
+        positions: Dict[str, int] = self._reconcile_positions()
         for vt_symbol, signal in self.signals.items():
-            if self.get_pos(vt_symbol) and signal.machine.n <= 0:
+            if positions.get(vt_symbol, 0) and signal.machine.n <= 0:
                 return
 
         self._target_reconciled = True
         self._reconcile_target_state()
+
+    def _reconcile_positions(self) -> Dict[str, int]:
+        """反推级别用的持仓：实盘以券商为准（柜台是唯一真相源），回测用本地。
+
+        券商数据未确认（既没有持仓推送、启动对账也没通过）时不能用：
+        主引擎缓存此时可能还是空的，空仓会被误判，进而清零真实持仓的级别。
+        """
+        if getattr(self, "live_mode", False) and (
+            getattr(self, "_broker_feed_ready", False)
+            or getattr(self, "_positions_verified", False)
+        ):
+            broker: Dict[str, int] = self._authoritative_positions()
+            if broker:
+                return {s: int(broker.get(s, 0)) for s in self.signals}
+        return {s: int(self.get_pos(s)) for s in self.signals}
 
     def _block_pending_reconcile_liquidation(
         self, vt_symbol: str, pos: int, target: int
@@ -1342,10 +1586,17 @@ class TurtleUsHkStrategy(StrategyTemplate):
 
         处理：
           · 空仓但状态有目标 -> 目标清零，等待新的突破信号
-          · 持仓与目标方向相反 -> 禁止下单，等待人工处理
+          · 整 unit 且在上限内 -> 按持仓反推级别
+          · 超上限 / 非整 unit / 方向与状态相反 / 禁空却持空头
+              -> 持有保护：级别夹到 [1, unit_limit] 供止损计算，禁止加仓、
+                 不自动减仓；状态机止损/离场（target=0）时照常平仓。
+                 旧逻辑是 _trading_blocked 全冻结，连止损都发不出（E-3）。
         """
+        positions: Dict[str, int] = self._reconcile_positions()
+        hold: Dict[str, str] = self._state_dict("_hold_symbols")
+
         for vt_symbol, signal in self.signals.items():
-            pos: int = int(self.get_pos(vt_symbol))
+            pos: int = int(positions.get(vt_symbol, 0))
             level: int = int(signal.machine.target)
 
             if pos == 0 and level != 0:
@@ -1357,23 +1608,6 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 self.write_log(
                     f"[对账] {vt_symbol} 券商空仓但状态目标={level}，"
                     "已清零并暂停当日开仓，等待下一交易日重建通道"
-                )
-                continue
-
-            # 禁止做空的配置下，任何非零空头目标都不允许
-            if pos < 0 and not self.allow_short and level != 0:
-                self._trading_blocked = True
-                self.write_log(
-                    f"[对账] {vt_symbol} 为空头 {pos}，但 allow_short=False，"
-                    "已禁止下单"
-                )
-                continue
-
-            if pos != 0 and level != 0 and (pos > 0) != (level > 0):
-                self._trading_blocked = True
-                self.write_log(
-                    f"[对账] {vt_symbol} 持仓方向={pos} 与状态目标={level} 相反，"
-                    "已禁止下单"
                 )
                 continue
 
@@ -1399,43 +1633,46 @@ class TurtleUsHkStrategy(StrategyTemplate):
 
             raw_level: float = abs(pos) / unit
             actual_level: int = int(round(raw_level))
+            limit: int = int(signal.machine.unit_limit)
 
-            # 超过最大级别：说明当前持仓本身已超出策略允许范围，
-            # 不能简单把 target 设为 actual（那会绕过 unit_limit），应拦截。
-            if raw_level > signal.machine.unit_limit + 0.25:
-                self._trading_blocked = True
-                self.write_log(
-                    f"[对账] {vt_symbol} 实际约 {raw_level:.2f} 个 unit，"
-                    f"超过上限 {signal.machine.unit_limit}，已禁止下单"
-                )
-                continue
+            # 以下情形不能直接采信：进入持有保护（不再全冻结，止损照常）
+            reason: str = ""
+            if pos < 0 and not self.allow_short:
+                reason = f"为空头 {pos}，但 allow_short=False"
+            elif level != 0 and (pos > 0) != (level > 0):
+                reason = f"持仓方向={pos} 与状态目标={level} 相反"
+            elif raw_level > limit + 0.25:
+                # 超上限不能把 target 设为 actual（会绕过 unit_limit）
+                reason = f"实际约 {raw_level:.2f} 个 unit，超过上限 {limit}"
+            elif actual_level <= 0 or abs(raw_level - actual_level) > 0.25:
+                # 非整 unit（含不足 1 个 unit）：不自动平掉零碎持仓
+                reason = f"持仓 {pos} 不是整 unit（约 {raw_level:.2f} 个）"
 
-            # 非整 unit（含不足 1 个 unit）：先人工核对，避免自动平掉零碎持仓
-            if actual_level <= 0 or abs(raw_level - actual_level) > 0.25:
-                self._trading_blocked = True
-                self.write_log(
-                    f"[对账] {vt_symbol} 持仓 {pos} 不是整 unit"
-                    f"（约 {raw_level:.2f} 个），已禁止下单"
+            if reason:
+                hold_level: int = max(1, min(actual_level, limit))
+                hold_target: int = hold_level if pos > 0 else -hold_level
+                if signal.machine.target != hold_target:
+                    self._set_machine_level(signal.machine, pos, hold_level)
+                    # 反推公式把开仓价设在「当前入场通道 + 级数×0.5N」，对异常持仓
+                    # （如假突破买入）会远高于真实成本，立即触发止损清仓。持有保护
+                    # 改用券商平均成本作为开仓价；拿不到时让止损退回离场通道。
+                    self._anchor_hold_entry(
+                        signal.machine, pos, self._broker_avg_cost(vt_symbol)
+                    )
+                signal.machine.rebase_next_add = False
+                hold[vt_symbol] = reason
+                self._alert(
+                    "WARN",
+                    f"hold_{vt_symbol}",
+                    f"[对账] {vt_symbol} {reason}：进入持有保护（禁止加仓、不自动减仓，"
+                    f"按 {hold_level} 级计算止损，止损/离场照常），请人工核对",
                 )
                 continue
 
             if actual_level != abs(level):
-                actual_level = min(actual_level, signal.machine.unit_limit)
+                actual_level = min(actual_level, limit)
                 new_target: int = actual_level if pos > 0 else -actual_level
-                signal.machine.target = new_target
-
-                # 同步最近开仓价到反推级别，避免止损仍按旧级别计算
-                level_index: int = max(1, actual_level // signal.machine.trading_size)
-                if pos > 0:
-                    signal.machine.long_entry = (
-                        signal.machine.entry_up
-                        + signal.machine.n * (level_index - 1) * 0.5
-                    )
-                else:
-                    signal.machine.short_entry = (
-                        signal.machine.entry_down
-                        - signal.machine.n * (level_index - 1) * 0.5
-                    )
+                self._set_machine_level(signal.machine, pos, actual_level)
 
                 # 下一级触发价重设到当前价 ± 0.5N，禁止按历史触发价补作业
                 signal.machine.rebase_next_add = True
@@ -1449,6 +1686,42 @@ class TurtleUsHkStrategy(StrategyTemplate):
                     f"（unit={unit}，持仓={pos}），状态目标 {level}→{new_target}，"
                     "下一级须从当前价再推进 0.5N"
                 )
+
+    @staticmethod
+    def _anchor_hold_entry(machine: Any, pos: int, avg_cost: float) -> None:
+        """持有保护的开仓价：券商平均成本；没有时取「离场通道 ± 止损距离」，止损即离场通道。"""
+        if pos > 0:
+            machine.long_entry = avg_cost if avg_cost > 0 else machine.exit_down + 2 * machine.n
+        else:
+            mult: float = float(getattr(machine, "short_stop_mult", 2.0) or 2.0)
+            machine.short_entry = avg_cost if avg_cost > 0 else machine.exit_up - mult * machine.n
+
+    def _broker_avg_cost(self, vt_symbol: str) -> float:
+        """券商持仓平均成本（IB averageCost，股票即每股成本）；取不到返回 0。"""
+        cached: float = float(self._state_dict("_broker_avg_cost_cache").get(vt_symbol, 0.0) or 0.0)
+        if cached > 0:
+            return cached
+        engine = getattr(self, "strategy_engine", None)
+        main_engine = getattr(engine, "main_engine", None)
+        if main_engine is None:
+            return 0.0
+        try:
+            for position in main_engine.get_all_positions():
+                if position.vt_symbol == vt_symbol and float(position.volume or 0):
+                    return float(position.price or 0.0)
+        except Exception:
+            return 0.0
+        return 0.0
+
+    @staticmethod
+    def _set_machine_level(machine: Any, pos: int, level: int) -> None:
+        """把状态机设为 pos 方向的 level 级，并同步最近开仓价（止损按该级计算）。"""
+        machine.target = level if pos > 0 else -level
+        level_index: int = max(1, level // machine.trading_size)
+        if pos > 0:
+            machine.long_entry = machine.entry_up + machine.n * (level_index - 1) * 0.5
+        else:
+            machine.short_entry = machine.entry_down - machine.n * (level_index - 1) * 0.5
 
     def _compute_equity(self) -> float:
         """组合净值：直接使用 account.balance（IB NetLiquidation）
@@ -1584,6 +1857,13 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 self._last_daily_date.isoformat() if self._last_daily_date else None
             ),
             "data_stale": bool(self._check_data_stale()),
+            # 保护状态：持有保护 / 当日冻结 / 行情静默 / 断线 / 资金口径 / 状态写盘
+            "hold_symbols": dict(self._state_dict("_hold_symbols")),
+            "frozen_symbols": dict(self._day_counters().get("frozen", {})),
+            "silent_symbols": sorted(self._state_set("_silent_symbols")),
+            "disconnect_block": bool(getattr(self, "_disconnect_block", False)),
+            "capital_mismatch": bool(getattr(self, "_capital_mismatch", False)),
+            "state_write_failed": bool(getattr(self, "_state_write_failed", False)),
         }
 
         path = base / f"heartbeat_{self.strategy_name}.json"
@@ -1748,8 +2028,64 @@ class TurtleUsHkStrategy(StrategyTemplate):
             self._trading_blocked = True
             self.write_log(f"[state] 迁移旧状态文件失败，已禁止下单: {exc}")
 
+    def _state_snapshot_invalid_reason(self) -> str:
+        """明显错误的快照（持仓存在但状态机未预热、N=0、无级别）拒绝写盘。"""
+        for vt_symbol, signal in self.signals.items():
+            try:
+                pos: int = int(self.get_pos(vt_symbol))
+            except Exception:
+                continue
+            machine = signal.machine
+            if (
+                pos
+                and not machine.inited
+                and float(machine.n) <= 0
+                and int(machine.target) == 0
+            ):
+                return f"{vt_symbol} 持仓 {pos} 但状态机未预热（N=0、级别=0）"
+        return ""
+
+    def _backup_state_file(self, path: Path) -> None:
+        """写盘前滚动备份上一份状态（30 分钟最多一份，保留最近 20 份）。"""
+        if not path.exists():
+            return
+        now: datetime = datetime.now()
+        last: datetime | None = getattr(self, "_state_backup_at", None)
+        if last is not None and (now - last).total_seconds() < 1800:
+            return
+        try:
+            backup_dir: Path = path.parent / "backup"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, backup_dir / f"{path.stem}.{now:%Y%m%d_%H%M%S}.json")
+            self._state_backup_at = now
+            backups: List[Path] = sorted(backup_dir.glob(f"{path.stem}.*.json"))
+            for old in backups[:-20]:
+                old.unlink(missing_ok=True)
+        except OSError as exc:
+            self.write_log(f"[state] 备份状态文件失败（不影响本次写入）: {exc}")
+
     def _save_state(self) -> None:
         """持久化状态机、订单账本、交易任务与风控锚点（schema v2）。"""
+        # on_start 加载完状态之前不写盘：初始化回放期间的快照是「历史中途」状态，
+        # 写下去会覆盖上次的有效状态（E-2）。测试用的裸对象没有该字段，按已就绪处理。
+        if not getattr(self, "_state_ready", True):
+            if not getattr(self, "_state_guard_logged", False):
+                self._state_guard_logged = True
+                self.write_log(
+                    "[state] 状态尚未加载完成（初始化/回放中），跳过写盘，"
+                    "防止覆盖上次的有效状态"
+                )
+            return
+
+        invalid: str = self._state_snapshot_invalid_reason()
+        if invalid:
+            self._log_throttled(
+                "state_invalid",
+                f"[state] 拒绝写入可疑快照：{invalid}；保留上一份状态文件",
+                1800,
+            )
+            return
+
         data: Dict[str, Any] = {}
         for vt_symbol, signal in self.signals.items():
             machine = signal.machine
@@ -1802,16 +2138,36 @@ class TurtleUsHkStrategy(StrategyTemplate):
             "last_quote_reject_reason": self._last_quote_reject_reason,
             "broker_feed_ready": bool(self._broker_feed_ready),
             "positions_mismatch_logged": bool(self._positions_mismatch_logged),
+            "order_counters": dict(self.__dict__.get("_order_counters") or {}),
+            "hold_symbols": dict(self.__dict__.get("_hold_symbols") or {}),
         }
 
         try:
             path = self._state_file()
+            self._backup_state_file(path)
             tmp = path.with_suffix(".tmp")
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2, default=str)
             tmp.replace(path)
-        except Exception as exc:                    # 持久化失败不阻断交易
-            self.write_log(f"[state] 保存失败: {exc}")
+        except Exception as exc:
+            # 偶发失败不阻断交易；连续 3 次失败视为致命：禁止新开仓并告警
+            errors: int = int(getattr(self, "_state_write_errors", 0)) + 1
+            self._state_write_errors = errors
+            self.write_log(f"[state] 保存失败（连续 {errors} 次）: {exc}")
+            if errors >= 3 and not getattr(self, "_state_write_failed", False):
+                self._state_write_failed = True
+                self._alert(
+                    "CRIT",
+                    "state_write_failed",
+                    f"[state] 状态文件连续 {errors} 次写入失败，已禁止新开仓（平仓照常）："
+                    f"{exc}",
+                )
+            return
+
+        self._state_write_errors = 0
+        if getattr(self, "_state_write_failed", False):
+            self._state_write_failed = False
+            self.write_log("[state] 状态文件写入已恢复，解除开仓限制")
 
     def _load_state(self) -> None:
         """恢复状态机、订单账本与当日交易状态（schema v2）。"""
@@ -1863,21 +2219,33 @@ class TurtleUsHkStrategy(StrategyTemplate):
         )
 
         restored: int = 0
+        skipped: List[str] = []
         for vt_symbol, fields in data.items():
             signal = self.signals.get(vt_symbol)
             if signal is None or not isinstance(fields, dict):
                 continue
 
             machine = signal.machine
-            machine.target = int(fields.get("target", 0))
-            machine.long_entry = float(fields.get("long_entry", 0.0))
-            machine.short_entry = float(fields.get("short_entry", 0.0))
-            machine.n = float(fields.get("n", 0.0))
-            machine.entry_up = float(fields.get("entry_up", 0.0))
-            machine.entry_down = float(fields.get("entry_down", 0.0))
-            machine.exit_up = float(fields.get("exit_up", 0.0))
-            machine.exit_down = float(fields.get("exit_down", 0.0))
-            machine.inited = bool(fields.get("inited", True))
+            saved_target: int = int(fields.get("target", 0) or 0)
+            saved_n: float = float(fields.get("n", 0.0) or 0.0)
+
+            # 只有「持有中」的标的才需要恢复冻结的入场通道 / N / 开仓价：
+            # 空仓标的用初始化回放刚算出的最新通道，不能被旧快照覆盖（E-2b）。
+            # 持有但 N<=0 的记录是坏快照，交给按券商持仓反推级别处理。
+            if saved_target != 0 and saved_n > 0:
+                machine.target = saved_target
+                machine.long_entry = float(fields.get("long_entry", 0.0))
+                machine.short_entry = float(fields.get("short_entry", 0.0))
+                machine.n = saved_n
+                machine.entry_up = float(fields.get("entry_up", 0.0))
+                machine.entry_down = float(fields.get("entry_down", 0.0))
+                machine.exit_up = float(fields.get("exit_up", 0.0))
+                machine.exit_down = float(fields.get("exit_down", 0.0))
+                self._state_set("_restored_held").add(vt_symbol)
+            elif saved_target != 0:
+                skipped.append(vt_symbol)
+                continue
+            # inited 以回放结果为准，绝不用快照把已预热的状态机改回未预热
             machine.traded = bool(
                 same_day and (legacy or bool(fields.get("traded", False)))
             )
@@ -1920,12 +2288,14 @@ class TurtleUsHkStrategy(StrategyTemplate):
             self._last_quote_reject_reason = str(
                 runtime.get("last_quote_reject_reason", "") or ""
             )
-            self._broker_feed_ready = bool(
-                runtime.get("broker_feed_ready", False)
-            )
+            # broker_feed_ready 只代表「本进程已收到持仓推送」，不能跨重启恢复：
+            # 恢复成 True 而缓存为空时，启动对账会把真实持仓误读成 0。
             self._positions_mismatch_logged = bool(
                 runtime.get("positions_mismatch_logged", False)
             )
+            counters: dict = dict(runtime.get("order_counters", {}) or {})
+            if counters.get("date") == self._today().isoformat():
+                self._order_counters = counters
 
             pause_until: str | None = runtime.get("pause_until")
             if pause_until:
@@ -1939,10 +2309,40 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 for vt_orderid in intent.get("orderids", []):
                     self._orderid_intent[vt_orderid] = intent_id
 
+        if skipped:
+            self._alert(
+                "WARN",
+                "state_bad_records",
+                f"[state] {skipped} 的状态记录有级别但 N<=0（坏快照），已忽略，"
+                "将按券商持仓反推级别",
+            )
         self.write_log(
             f"[state] 已恢复 {restored} 个标的的状态、"
             f"{len(self.order_ledger)} 个订单意图: {path}"
         )
+
+    def _align_unheld_machines(self) -> None:
+        """实盘：状态文件里不是持有中的标的，状态机回到空仓并用最新通道。
+
+        初始化回放会按历史数据模拟开平仓，回放结束时状态机可能「以为」自己
+        还持有某只股票（入场通道与 N 冻结在历史开仓点）。真实持仓以状态文件
+        + 券商持仓为准，其余一律复位；券商有而状态没有的，由 _reconcile_target_state
+        按持仓反推级别。
+        """
+        held: set = self._state_set("_restored_held")
+        for vt_symbol, signal in self.signals.items():
+            if vt_symbol in held:
+                continue
+            machine = signal.machine
+            reset = getattr(machine, "reset_flat", None)
+            try:
+                if callable(reset):
+                    reset()
+                else:
+                    machine.target = 0
+            except Exception as exc:
+                machine.target = 0
+                self.write_log(f"[state] {vt_symbol} 重算最新通道失败: {exc}")
 
     def _reject_tick(self, tick: TickData, reason: str) -> None:
         """记录被行情质量闸门丢弃的 tick，同原因只打一条日志避免刷屏。"""
@@ -2011,9 +2411,21 @@ class TurtleUsHkStrategy(StrategyTemplate):
         prev_tick: TickData | None = self.pbg.last_ticks.get(tick.vt_symbol)
         if prev_tick and prev_tick.last_price > 0 and self.price_max_jump_pct > 0:
             jump: float = abs(price - prev_tick.last_price) / prev_tick.last_price
+            pending: Dict[str, list] = self._state_dict("_jump_pending")
             if jump > self.price_max_jump_pct:
-                self._reject_tick(tick, "price_jump")
-                return False
+                # 参考价只随被接受的 tick 更新：真实跳空（复牌/除权/暴跌）后若一直拒收，
+                # 该标的会被永久屏蔽、止损失效。连续 3 笔彼此一致的跳变价视为新价位。
+                if not self._confirm_price_jump(tick.vt_symbol, price):
+                    self._reject_tick(tick, "price_jump")
+                    return False
+                self._alert(
+                    "WARN",
+                    f"jump_{tick.vt_symbol}",
+                    f"[行情] {tick.vt_symbol} 价格跳变已连续确认"
+                    f"（{prev_tick.last_price} → {price}），重设跳价基准",
+                )
+            else:
+                pending.pop(tick.vt_symbol, None)
 
         if (
             self.enforce_trading_session
@@ -2025,6 +2437,21 @@ class TurtleUsHkStrategy(StrategyTemplate):
 
         return True
 
+    def _confirm_price_jump(self, vt_symbol: str, price: float) -> bool:
+        """跳变价与上一笔待确认价相差 1% 以内则累计，满 3 笔返回 True。"""
+        pending: Dict[str, list] = self._state_dict("_jump_pending")
+        candidate: list | None = pending.get(vt_symbol)
+        if candidate and candidate[0] > 0 and abs(price - candidate[0]) / candidate[0] <= 0.01:
+            candidate[0] = price
+            candidate[1] += 1
+        else:
+            candidate = [price, 1]
+            pending[vt_symbol] = candidate
+        if candidate[1] >= 3:
+            pending.pop(vt_symbol, None)
+            return True
+        return False
+
     def on_tick(self, tick: TickData):
         """Tick推送：先过质量闸门，再合成分钟 bar。"""
         if not self._is_tick_valid(tick):
@@ -2032,6 +2459,11 @@ class TurtleUsHkStrategy(StrategyTemplate):
 
         self._tick_count += 1
         self._last_tick_time = tick.datetime.isoformat()
+        self._state_dict("_last_valid_tick_wall")[tick.vt_symbol] = self._hk_now()
+        silent: set = self._state_set("_silent_symbols")
+        if tick.vt_symbol in silent:
+            silent.discard(tick.vt_symbol)
+            self.write_log(f"[行情] {tick.vt_symbol} 行情已恢复")
 
         # 首笔有效 tick 落一条日志：区分「IB 根本没推行情」与「bar 合成异常」
         if self._tick_count == 1:
@@ -2199,9 +2631,11 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 self.quarantine_orderids.add(oid)
 
         if self.quarantine_orderids and not getattr(self, "_quarantine_logged", False):
-            self.write_log(
+            self._alert(
+                "WARN",
+                "quarantine",
                 f"[订单] {len(self.quarantine_orderids)} 个委托状态未确认，"
-                "已隔离并暂停新交易意图；请查询券商活动委托"
+                "已隔离并暂停相关标的的新委托；请在 IB 端核对活动委托",
             )
             self._quarantine_logged = True
         elif not self.quarantine_orderids:
@@ -2303,6 +2737,8 @@ class TurtleUsHkStrategy(StrategyTemplate):
             plan, side, direction, offset, price, volume, reason
         )
         self._record_order_intent(vt_symbol, float(plan.get("price", price)), int(volume))
+        if self.live_mode:
+            self._journal_order(intent, plan)
 
         vt_orderids: list[str] = self.send_order(
             vt_symbol,
@@ -2313,12 +2749,20 @@ class TurtleUsHkStrategy(StrategyTemplate):
             net=True,
         )
 
+        if self.live_mode:
+            self._note_order_sent(vt_symbol, bool(plan.get("is_open", False)))
+
         if not vt_orderids:
             intent["status"] = "REJECTED"
             intent["remaining"] = 0
             intent["updated_at"] = datetime.now().isoformat()
             self._symbol_active_intent.pop(vt_symbol, None)
-            self.write_log(f"[订单] {vt_symbol} 本地发单失败，意图 {intent['intent_id']} 标记 REJECTED")
+            self.write_log(
+                f"[订单] {vt_symbol} 本地发单失败（风控拦截或网关拒绝），"
+                f"意图 {intent['intent_id']} 标记 REJECTED"
+            )
+            if self.live_mode:
+                self._note_reject(vt_symbol)
             self._save_state_throttled(force=True)
             return []
 
@@ -2331,6 +2775,161 @@ class TurtleUsHkStrategy(StrategyTemplate):
         self._save_state_throttled(force=True)
         return vt_orderids
 
+    def _journal_order(self, intent: dict, plan: dict) -> None:
+        """每笔委托的决策快照（信号、通道、仓位口径、风控状态），事后可完整复盘。"""
+        signal = self.signals.get(intent["vt_symbol"]) if hasattr(self, "signals") else None
+        machine = getattr(signal, "machine", None)
+        record: dict = {
+            "time": datetime.now().isoformat(timespec="seconds"),
+            "intent_id": intent["intent_id"],
+            "vt_symbol": intent["vt_symbol"],
+            "side": intent["side"],
+            "qty": intent["qty"],
+            "price": intent["price"],
+            "reason": intent["reason"],
+            "plan": {k: plan.get(k) for k in ("pos", "target", "price", "diff", "is_open", "rank")},
+            "machine": {
+                k: getattr(machine, k, None)
+                for k in ("target", "n", "entry_up", "entry_down", "long_entry",
+                          "short_entry", "exit_up", "exit_down", "cci", "traded")
+            } if machine is not None else {},
+            "unit": getattr(signal, "unit", None),
+            "context": {
+                "account_balance": self.account_balance,
+                "account_available": self.account_available,
+                "risk_equity": self._risk_equity(),
+                "capital": self.capital,
+                "breadth": getattr(self, "market_breadth", None),
+                "er": getattr(self, "er_values", {}).get(intent["vt_symbol"]),
+                "safety_mode": self.safety_mode,
+                "close_only": bool(self.close_only),
+                "trading_blocked": bool(self._trading_blocked),
+                "hold": self._state_dict("_hold_symbols").get(intent["vt_symbol"]),
+                "last_daily_date": str(
+                    self._state_dict("_last_daily_dates").get(intent["vt_symbol"])
+                    or self._last_daily_date
+                ),
+            },
+        }
+        base = Path(self.state_dir) if self.state_dir else Path.cwd() / "state"
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            with open(base / f"orders_{datetime.now():%Y%m%d}.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        except OSError as exc:
+            self._log_throttled("order_journal", f"[订单] 写决策快照失败: {exc}", 600)
+
+    # ------------------------------------------------------------------
+    # 实盘执行保护：按交易日计数 / 拒单熔断 / 频率上限 / 价格偏离
+    # ------------------------------------------------------------------
+    def _day_counters(self) -> dict:
+        """按港股交易日重置的计数器：orders（开仓委托数）/ rejects / frozen。"""
+        today: str = self._today().isoformat()
+        counters: dict = self.__dict__.get("_order_counters") or {}
+        if counters.get("date") != today:
+            counters = {"date": today, "orders": {}, "rejects": {}, "frozen": {}}
+            self._order_counters = counters
+        for key in ("orders", "rejects", "frozen"):
+            counters.setdefault(key, {})
+        return counters
+
+    def _note_order_sent(self, vt_symbol: str, is_open: bool) -> None:
+        times: deque = self.__dict__.get("_order_times")
+        if times is None:
+            times = deque()
+            self._order_times = times
+        times.append(datetime.now())
+        if is_open:
+            orders: dict = self._day_counters()["orders"]
+            orders[vt_symbol] = int(orders.get(vt_symbol, 0)) + 1
+
+    def _note_reject(self, vt_symbol: str) -> None:
+        counters: dict = self._day_counters()
+        rejects: dict = counters["rejects"]
+        count: int = int(rejects.get(vt_symbol, 0)) + 1
+        rejects[vt_symbol] = count
+        limit: int = int(getattr(self, "max_rejects_per_symbol_day", 0) or 0)
+        if limit > 0 and count >= limit and vt_symbol not in counters["frozen"]:
+            counters["frozen"][vt_symbol] = f"当日拒单 {count} 次"
+            self._alert(
+                "CRIT",
+                f"reject_freeze_{vt_symbol}",
+                f"[订单] {vt_symbol} 当日已被拒单 {count} 次，冻结该标的至下一交易日；"
+                "请查 IB 拒单原因（价位/手数/权限/资金）",
+            )
+
+    def _pretrade_order_check(
+        self, vt_symbol: str, side: str, price: float, is_open: bool
+    ) -> str:
+        """实盘发单前检查，返回拒绝原因（空串 = 放行）。平仓只受频率与冻结约束。"""
+        frozen: str = self._day_counters()["frozen"].get(vt_symbol, "")
+        if frozen:
+            return f"标的已冻结（{frozen}）"
+
+        per_minute: int = int(getattr(self, "max_orders_per_minute", 0) or 0)
+        if per_minute > 0:
+            times: deque = self.__dict__.get("_order_times") or deque()
+            cutoff: datetime = datetime.now() - timedelta(seconds=60)
+            while times and times[0] < cutoff:
+                times.popleft()
+            if len(times) >= per_minute:
+                return f"全局委托频率超限（每分钟 {per_minute} 笔）"
+
+        if not is_open:
+            return ""
+
+        per_day: int = int(getattr(self, "max_orders_per_symbol_day", 0) or 0)
+        sent: int = int(self._day_counters()["orders"].get(vt_symbol, 0))
+        if per_day > 0 and sent >= per_day:
+            return f"当日开仓委托已达上限 {per_day} 笔"
+
+        max_age: float = float(getattr(self, "max_quote_age_for_open", 0.0) or 0.0)
+        max_dev: float = float(getattr(self, "max_price_deviation", 0.0) or 0.0)
+        if max_age <= 0 and max_dev <= 0:
+            return ""
+
+        tick: TickData | None = self.pbg.last_ticks.get(vt_symbol)
+        if tick is None or not tick.last_price:
+            return "无最新有效行情"
+        if max_age > 0:
+            seen: datetime | None = self._state_dict("_last_valid_tick_wall").get(vt_symbol)
+            if seen is None or (self._hk_now() - seen).total_seconds() > max_age:
+                return f"最新有效行情超过 {max_age:.0f} 秒"
+        if max_dev > 0:
+            if side == "BUY":
+                ref: float = float(tick.ask_price_1 or 0.0) or float(tick.last_price)
+            else:
+                ref = float(tick.bid_price_1 or 0.0) or float(tick.last_price)
+            if ref > 0 and abs(price / ref - 1.0) > max_dev:
+                return f"限价 {price} 偏离最新{'卖一' if side == 'BUY' else '买一'} {ref} 超过 {max_dev:.1%}"
+        return ""
+
+    def _broker_sell_cap(self, vt_symbol: str) -> int | None:
+        """禁空时卖出数量上限 = 券商多头持仓；券商数据未就绪返回 None。"""
+        if not (self._broker_feed_ready or self._positions_verified):
+            return None
+        broker: Dict[str, int] = self._broker_net_positions()
+        if not broker:
+            return None
+        return max(0, int(broker.get(vt_symbol, 0)))
+
+    def _quarantine_symbols(self) -> tuple[set, int]:
+        """隔离委托涉及的标的；无法归属标的的委托数单独返回（只能全局暂停）。"""
+        symbols: set = set()
+        unknown: int = 0
+        orders: dict = getattr(self, "orders", {}) or {}
+        for vt_orderid in self.quarantine_orderids:
+            order = orders.get(vt_orderid)
+            vt_symbol: str = getattr(order, "vt_symbol", "") if order is not None else ""
+            if not vt_symbol:
+                intent_id = self._orderid_intent.get(vt_orderid)
+                vt_symbol = self.order_ledger.get(intent_id or "", {}).get("vt_symbol", "")
+            if vt_symbol:
+                symbols.add(vt_symbol)
+            else:
+                unknown += 1
+        return symbols, unknown
+
     def _submit_plans(self, plans: List[dict], reason: str) -> None:
         """所有发单统一入口：先幂等检查，再按计划生成唯一意图。"""
         if not self.trading:
@@ -2342,9 +2941,17 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 self._recovery_logged = True
             return
 
-        if self.quarantine_orderids:
+        if getattr(self, "_suppress_orders", False):
+            # 收盘定时日切时补处理最后一根分钟 bar：只更新状态，不在收市后发单
+            return
+
+        # 隔离委托只暂停其所属标的；无法归属标的时才全局暂停
+        quarantined, unknown = self._quarantine_symbols()
+        if unknown:
             if not getattr(self, "_quarantine_logged", False):
-                self.write_log("[订单] 存在状态未确认的隔离委托，暂停新发单")
+                self.write_log(
+                    f"[订单] {unknown} 个隔离委托无法确认所属标的，暂停全部新发单"
+                )
                 self._quarantine_logged = True
             return
 
@@ -2354,9 +2961,22 @@ class TurtleUsHkStrategy(StrategyTemplate):
             if not diff:
                 continue
 
+            if vt_symbol in quarantined:
+                self._log_throttled(
+                    f"quarantine_{vt_symbol}",
+                    f"[订单] {vt_symbol} 存在状态未确认的隔离委托，暂停该标的发单",
+                )
+                continue
+
             pos: int = int(plan.get("pos", 0))
-            if self._active_intent_for_symbol(vt_symbol) is not None:
-                self.write_log(f"[订单] {vt_symbol} 已有未完成意图，跳过本轮委托")
+            active: dict | None = self._active_intent_for_symbol(vt_symbol)
+            if active is not None:
+                self._log_throttled(
+                    f"intent_{active.get('intent_id', vt_symbol)}",
+                    f"[订单] {vt_symbol} 已有未完成意图 {active.get('intent_id', '')}"
+                    f"（{active.get('status', '')}），跳过本轮委托",
+                    3600,
+                )
                 continue
 
             pricetick: float = self.get_pricetick(vt_symbol)
@@ -2383,13 +3003,37 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 direction = Direction.SHORT
                 offset = Offset.CLOSE if pos > 0 else Offset.OPEN
 
+            volume: int = abs(diff)
+            if self.live_mode:
+                # 禁空：卖出量不超过券商实际多头持仓，本地 pos 偏大时也不会卖成空头
+                if side == "SELL" and not self.allow_short:
+                    cap: int | None = self._broker_sell_cap(vt_symbol)
+                    if cap is not None and cap < volume:
+                        self._log_throttled(
+                            f"sell_cap_{vt_symbol}",
+                            f"[订单] {vt_symbol} 卖出 {volume} 超过券商持仓 {cap}，按 {cap} 下单",
+                        )
+                        volume = cap
+                    if volume <= 0:
+                        continue
+
+                refuse: str = self._pretrade_order_check(
+                    vt_symbol, side, order_price, bool(plan.get("is_open", False))
+                )
+                if refuse:
+                    self._log_throttled(
+                        f"refuse_{vt_symbol}_{refuse[:12]}",
+                        f"[订单] {vt_symbol} {side} {volume}@{order_price} 未发送：{refuse}",
+                    )
+                    continue
+
             self._submit_order_intent(
                 plan,
                 side,
                 direction,
                 offset,
                 order_price,
-                abs(diff),
+                volume,
                 reason,
             )
 
@@ -2453,6 +3097,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
         else:
             intent["status"] = "ACTIVE"
 
+        # 已归属到账本意图且券商已受理：不再是「来历不明」的隔离委托
+        if status_name != "SUBMITTING":
+            self.quarantine_orderids.discard(vt_orderid)
+
         if intent["status"] in _TERMINAL_INTENT_STATUSES:
             self._symbol_active_intent.pop(intent["vt_symbol"], None)
             self.quarantine_orderids.discard(vt_orderid)
@@ -2461,6 +3109,8 @@ class TurtleUsHkStrategy(StrategyTemplate):
                     f"[订单] {intent['vt_symbol']} 意图 {intent_id} 终态="
                     f"{intent['status']}，成交 {intent['filled']}/{qty}"
                 )
+                if intent["status"] == "REJECTED" and getattr(self, "live_mode", False):
+                    self._note_reject(intent["vt_symbol"])
         elif not order.is_active():
             intent["status"] = "CANCELLED"
             intent["remaining"] = 0
@@ -2520,7 +3170,9 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 intent["status"] = "CANCELLING"
                 intent["updated_at"] = datetime.now().isoformat()
             self.cancel_order(vt_orderid)
-        self.write_log(f"[订单] 已请求撤销全部活动委托（{reason}）")
+        self._log_throttled(
+            f"cancel_all_{reason}", f"[订单] 已请求撤销全部活动委托（{reason}）", 300
+        )
 
     def _has_pending_orders(self) -> bool:
         if self.active_orderids or self.quarantine_orderids:
@@ -2546,26 +3198,72 @@ class TurtleUsHkStrategy(StrategyTemplate):
         self._last_state_save = now
         self._save_state()
 
-    def on_broker_recovery_complete(self) -> None:
-        """bootstrap 完成 reqAllOpenOrders 后调用：解除启动冻结并清理账本。"""
+    def on_broker_recovery_complete(
+        self,
+        confirmed: bool = True,
+        active_orderids: set | None = None,
+    ) -> None:
+        """bootstrap 完成活动委托恢复后调用：解除冻结并清理账本。
+
+        confirmed=True：已收到 IB openOrderEnd，券商侧活动委托已全部回报。
+            active_orderids 给出时，以它为准——账本里没有任何委托仍在券商侧
+            活动的意图一律 EXPIRED（覆盖断线重连：断线前见过回报的委托也会被核实）；
+            未给出时退回旧口径（本进程从未见过券商回报的意图 EXPIRED）。
+        confirmed=False：重试用尽仍未确认。未确认意图保持非终态（继续冻结所属
+            标的），其他标的恢复交易，并告警人工核对。
+        """
         expired: int = 0
+        unconfirmed: int = 0
+        now: str = datetime.now().isoformat()
         for intent in self.order_ledger.values():
             if intent.get("status") in _TERMINAL_INTENT_STATUSES:
                 continue
-            if not intent.get("seen_broker", False):
-                intent["status"] = "EXPIRED"
-                intent["remaining"] = 0
-                intent["updated_at"] = datetime.now().isoformat()
-                self._symbol_active_intent.pop(intent["vt_symbol"], None)
-                expired += 1
+            if confirmed and active_orderids is not None:
+                still_live: bool = any(
+                    oid in active_orderids for oid in intent.get("orderids", [])
+                )
+            else:
+                still_live = bool(intent.get("seen_broker", False))
+            if still_live:
+                continue
+            if not confirmed:
+                unconfirmed += 1
+                continue
+            intent["status"] = "EXPIRED"
+            intent["remaining"] = 0
+            intent["updated_at"] = now
+            self._symbol_active_intent.pop(intent["vt_symbol"], None)
+            expired += 1
+
+        # 券商确认不在活动列表里的本地委托 id：移出活动/隔离集合，避免永久卡住
+        dropped: int = 0
+        if confirmed and active_orderids is not None:
+            for vt_orderid in list(self.active_orderids | self.quarantine_orderids):
+                if vt_orderid in active_orderids:
+                    continue
+                self.active_orderids.discard(vt_orderid)
+                self.quarantine_orderids.discard(vt_orderid)
+                dropped += 1
 
         self._recovery_pending = False
         self._recovery_logged = False
-        self.write_log(
-            f"[订单] 券商活动委托恢复完成；清理未确认意图 {expired} 个，"
-            f"保留活动意图 "
-            f"{sum(1 for i in self.order_ledger.values() if i.get('status') not in _TERMINAL_INTENT_STATUSES)} 个"
+        self._recovery_completed_at = datetime.now()
+        remaining_live: int = sum(
+            1 for i in self.order_ledger.values()
+            if i.get("status") not in _TERMINAL_INTENT_STATUSES
         )
+        if confirmed:
+            self.write_log(
+                f"[订单] 券商活动委托恢复完成；清理未确认意图 {expired} 个、"
+                f"失效委托 id {dropped} 个，保留活动意图 {remaining_live} 个"
+            )
+        else:
+            self._alert(
+                "WARN",
+                "recovery_unconfirmed",
+                f"[订单] 未收到 IB 活动委托回报结束信号（重试已用尽）；{unconfirmed} 个"
+                "未确认意图继续冻结其所属标的，请在 IB 端核对活动委托",
+            )
         self._save_state_throttled(force=True)
 
     # ------------------------------------------------------------------
@@ -2640,21 +3338,76 @@ class TurtleUsHkStrategy(StrategyTemplate):
         return plans
 
     def _handle_emergency_flatten(self, bars: Dict[str, BarData]) -> None:
+        now: datetime = datetime.now()
         if not self._emergency_logged:
-            self.write_log("[应急] 检测到 flatten 标记：进入强制清仓模式，禁止任何开仓/加仓")
+            self._alert(
+                "CRIT",
+                "emergency_flatten",
+                "[应急] 检测到 flatten 标记：进入强制清仓模式，禁止任何开仓/加仓",
+            )
             self._emergency_logged = True
+            self._emergency_since = now
+            self._global_cancel_sent = False
 
-        if self._has_pending_orders():
+        # 撤掉全部活动委托；有在途意图的标的由 _submit_plans 逐个跳过，
+        # 其余标的立即平仓——不再因为某一笔委托未终结就全体等待。
+        if self.active_orderids:
             self._cancel_all_active_orders("emergency_flatten")
-            self.write_log("[应急] 等待活动委托进入终态后再发平仓单")
-            return
+
+        # 隔离委托撤不掉（本地查不到委托）超过 60 秒：直接请 IB 全局撤单
+        since: datetime = getattr(self, "_emergency_since", None) or now
+        if (
+            self.quarantine_orderids
+            and not getattr(self, "_global_cancel_sent", False)
+            and (now - since).total_seconds() > 60
+        ):
+            self._request_global_cancel()
 
         plans: List[dict] = self._make_close_only_plans(bars)
         if not plans:
-            self.write_log("[应急] 当前无可平仓持仓")
+            self._log_throttled("emergency_flat", "[应急] 当前无可平仓持仓", 600)
             return
 
         self._submit_plans(plans, "emergency_flatten")
+
+    def _commit_stale_daily_bars(self, bars: Dict[str, BarData]) -> None:
+        """日K合成器里残留的「前一交易日」日K：在新交易日第一根 bar 之前提交。"""
+        daily_bars: dict = getattr(self.pbg, "daily_bars", None) or {}
+        committed: Dict[str, date] = self._state_dict("_last_daily_dates")
+        finished: Dict[str, BarData] = {}
+        for vt_symbol, bar in bars.items():
+            daily_bar: BarData | None = daily_bars.get(vt_symbol)
+            if daily_bar is None or daily_bar.datetime.date() >= bar.datetime.date():
+                continue
+            # 该日已在 daily_end 提交过：残留的是收市后（竞价）bar，保持旧行为并入次日，
+            # 不能再提交成一根「额外的一天」（否则通道周期被压缩）
+            last: date | None = committed.get(vt_symbol)
+            if last is not None and daily_bar.datetime.date() <= last:
+                continue
+            daily_bar.datetime = daily_bar.datetime.replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            finished[vt_symbol] = daily_bar
+            daily_bars[vt_symbol] = None
+        if finished:
+            self.on_daily_bars(finished)
+
+    def _request_global_cancel(self) -> None:
+        """应急兜底：让 IB 撤销本账户全部活动委托（不依赖本地委托记录）。"""
+        self._global_cancel_sent = True
+        try:
+            from ibapi.order_cancel import OrderCancel
+
+            gateway = self.strategy_engine.main_engine.get_gateway("IB")
+            gateway.api.client.reqGlobalCancel(OrderCancel())
+        except Exception as exc:
+            self._alert("CRIT", "global_cancel_failed", f"[应急] IB 全局撤单失败: {exc}")
+            return
+        self._alert(
+            "CRIT",
+            "global_cancel",
+            "[应急] 隔离委托 60 秒未能撤销，已向 IB 发送全局撤单（reqGlobalCancel）",
+        )
 
     def on_bars(self, bars: Dict[str, BarData]):
         """原始K线推送"""
@@ -2663,10 +3416,17 @@ class TurtleUsHkStrategy(StrategyTemplate):
 
         bar: BarData = list(bars.values())[0]
         self._last_bar_time = bar.datetime.isoformat()
-        self.write_log(f"{bar.datetime} - {list(bars.keys())}")
 
         # 无法确认券商状态的委托进入隔离区；不再本地直接丢弃。
         self._prune_ghost_orders()
+
+        # 上一交易日没有 daily_end 那一分钟的 bar（无成交 / 半日市）：
+        # 先提交它，再用新通道计算今天的第一根 bar，避免两天合成一根日K。
+        self._commit_stale_daily_bars(bars)
+
+        # 断线保护：重连 + 委托恢复 + 持仓一致后自动解除（定时器也会检查）
+        if self.live_mode and self.trading:
+            self._try_clear_disconnect_block()
 
         emergency: bool = self._emergency_active()
 
@@ -2728,10 +3488,13 @@ class TurtleUsHkStrategy(StrategyTemplate):
             signal: TurtleSignal = self.signals[vt_symbol]
             signal.update_daily_bar(bar)
 
-            # 记录最近一根日K的交易日，供数据新鲜度闸门判断缺口
+            # 记录最近一根日K的交易日，供数据新鲜度闸门判断缺口（组合 + 逐标的）
             bar_date: date = bar.datetime.date()
             if self._last_daily_date is None or bar_date > self._last_daily_date:
                 self._last_daily_date = bar_date
+            per_symbol: Dict[str, date] = self._state_dict("_last_daily_dates")
+            if per_symbol.get(vt_symbol) is None or bar_date > per_symbol[vt_symbol]:
+                per_symbol[vt_symbol] = bar_date
 
             # 记录日收盘价（P1-1 波动率 / P1-3 趋势选股 / P1-9 相对强度共用）
             dq = self.daily_closes.get(vt_symbol)
@@ -2782,11 +3545,162 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # P0-3：每日收盘后落盘（防 IB 每日强制断线导致重启后失忆）
         # 同样只在已启动后保存，避免初始化阶段把 baseline_equity=0 写进文件。
         if self.use_state_persist and self.live_mode and self.trading:
+            self._state_backup_at = None        # 每日收盘强制留一份备份快照
             self._save_state()
 
         # P0-2：每日收盘自动导出执行监控（无需人工干预）
         if self.export_fills_daily and self.live_mode and self.trading:
             self._auto_export_fills()
+
+    # ------------------------------------------------------------------
+    # 引擎定时器（bootstrap 每 5 秒调用一次，与行情无关）
+    # ------------------------------------------------------------------
+    def on_engine_timer(self) -> None:
+        """不依赖 tick 的周期检查：断线恢复 / 收盘日切 / 行情静默 / 尾盘未成交。"""
+        if not (self.live_mode and self.trading):
+            return
+        now: datetime = self._hk_now()
+        self._try_clear_disconnect_block()
+        self._finalize_daily_at_close(now)
+        self._check_quote_silence(now)
+        self._check_eod_open_intents(now)
+
+    @staticmethod
+    def _session_close_time(day: date) -> time:
+        calendar = _hk_calendar()
+        if calendar is not None:
+            return calendar.session_close(day)
+        return time(16, 0)
+
+    @staticmethod
+    def _is_hk_trading_day(day: date) -> bool:
+        calendar = _hk_calendar()
+        if calendar is not None:
+            return calendar.is_trading_day(day)
+        return day.weekday() < 5
+
+    def _hk_symbols_only(self) -> bool:
+        symbols: List[str] = list(getattr(self, "vt_symbols", []) or [])
+        return bool(symbols) and all(s.endswith(".SEHK") for s in symbols)
+
+    def _finalize_daily_at_close(self, now: datetime) -> None:
+        """收市后 1 分钟完成当日日切（港股）。
+
+        16:00 之后的 tick 被时段闸门丢弃，15:59 的分钟 bar 原本要等次日
+        9:30 第一笔 tick 才推出，当日日K随之推迟；若某标的 15:59 没有成交，
+        或遇半日市（12:00 收市），日K会与次日合并成一根。这里在收市后：
+          1. 推出各标的未完成的最后一根分钟 bar（只更新状态，不发单）；
+          2. 把尚未提交的当日日K强制提交给 on_daily_bars。
+        """
+        if not self._hk_symbols_only():
+            return
+        today: date = now.date()
+        key: str = today.isoformat()
+        if getattr(self, "_daily_finalized_date", "") == key:
+            return
+        if not self._is_hk_trading_day(today):
+            return
+        close_at: datetime = datetime.combine(
+            today, self._session_close_time(today), tzinfo=_HK_TZ
+        ) + timedelta(minutes=1)
+        if now < close_at:
+            return
+        self._daily_finalized_date = key
+
+        pending_bars: Dict[str, BarData] = {}
+        for vt_symbol, bar in list(self.pbg.bars.items()):
+            if bar is None or bar.datetime.astimezone(_HK_TZ).date() != today:
+                continue
+            self.pbg.bars.pop(vt_symbol, None)
+            bar.datetime = bar.datetime.replace(second=0, microsecond=0)
+            pending_bars[vt_symbol] = bar
+
+        self._suppress_orders = True
+        try:
+            for vt_symbol, bar in pending_bars.items():
+                self.on_bars({vt_symbol: bar})
+        finally:
+            self._suppress_orders = False
+
+        finished: Dict[str, BarData] = {}
+        for vt_symbol, daily_bar in list(self.pbg.daily_bars.items()):
+            if daily_bar is None:
+                continue
+            if daily_bar.datetime.astimezone(_HK_TZ).date() != today:
+                continue
+            daily_bar.datetime = daily_bar.datetime.replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            finished[vt_symbol] = daily_bar
+            self.pbg.daily_bars[vt_symbol] = None
+        if finished:
+            self.on_daily_bars(finished)
+
+        self.write_log(
+            f"[日切] {key} 收市日切完成：补推分钟 bar {len(pending_bars)} 根，"
+            f"补提交日K {len(finished)} 根（其余已在最后一分钟提交）"
+        )
+
+    def _check_quote_silence(self, now: datetime) -> None:
+        """交易时段内某标的长时间无有效 tick：告警（止损依赖行情，静默即裸奔）。"""
+        limit: float = float(getattr(self, "quote_silence_seconds", 0.0) or 0.0)
+        if limit <= 0 or not self._hk_symbols_only():
+            return
+        today: date = now.date()
+        if not self._is_hk_trading_day(today):
+            return
+        local: time = now.time().replace(tzinfo=None)
+        close_t: time = self._session_close_time(today)
+        if time(9, 30) <= local < time(12, 0):
+            segment_start: datetime = datetime.combine(today, time(9, 30), tzinfo=_HK_TZ)
+        elif time(13, 0) <= local < close_t:
+            segment_start = datetime.combine(today, time(13, 0), tzinfo=_HK_TZ)
+        else:
+            return
+
+        started: datetime | None = getattr(self, "_started_wall", None)
+        walls: Dict[str, datetime] = self._state_dict("_last_valid_tick_wall")
+        silent: set = self._state_set("_silent_symbols")
+        for vt_symbol in self.vt_symbols:
+            reference: datetime = max(
+                d for d in (walls.get(vt_symbol), segment_start, started) if d is not None
+            )
+            if (now - reference).total_seconds() < limit or vt_symbol in silent:
+                continue
+            silent.add(vt_symbol)
+            self._alert(
+                "WARN",
+                f"quote_silence_{vt_symbol}",
+                f"[行情] {vt_symbol} 已 {int((now - reference).total_seconds())} 秒无有效行情"
+                "（止损依赖行情），请检查 IB 行情订阅/权限",
+            )
+
+    def _check_eod_open_intents(self, now: datetime) -> None:
+        """收市前 10 分钟仍有未完成委托：告警（DAY 单收市即失效，计划仓位可能未达成）。"""
+        today: date = now.date()
+        key: str = today.isoformat()
+        if getattr(self, "_eod_checked_date", "") == key or not self._is_hk_trading_day(today):
+            return
+        close_at: datetime = datetime.combine(
+            today, self._session_close_time(today), tzinfo=_HK_TZ
+        )
+        if not (close_at - timedelta(minutes=10) <= now < close_at):
+            return
+        self._eod_checked_date = key
+
+        pending: List[str] = [
+            f"{i.get('vt_symbol')} {i.get('side')} 剩余 {i.get('remaining')}"
+            for i in self.order_ledger.values()
+            if i.get("status") not in _TERMINAL_INTENT_STATUSES
+            and int(i.get("remaining", 0)) > 0
+        ]
+        if pending:
+            self._alert(
+                "WARN",
+                "eod_open_orders",
+                f"[订单] 收市前 10 分钟仍有 {len(pending)} 个未完成委托："
+                + "；".join(pending[:5]),
+            )
 
     def calculate_targets(self, bars: Dict[str, BarData]) -> None:
         """计算每个合约的目标"""
@@ -3289,9 +4203,14 @@ class TurtleUsHkStrategy(StrategyTemplate):
         )
 
     def _risk_equity(self) -> float:
-        """风控分母：实盘用 IB 净值，回测保持 capital 以复现基线。"""
-        if self.live_mode and self.equity > 0:
-            return float(self.equity)
+        """风控分母：实盘只用 IB 净值，回测保持 capital 以复现基线。
+
+        实盘拿不到账户净值时返回 0（权重与敞口额度随之为 0，新开仓全部被拦），
+        绝不回退到 capital 递推值——E-1 就是 account_balance=0 时回退到
+        回测资金 150 万，按 26 万账户的 6 倍规模下了单。
+        """
+        if self.live_mode:
+            return float(self.account_balance) if self.account_balance > 0 else 0.0
         return float(self.capital)
 
     def _cap_target_by_weight(
@@ -3341,19 +4260,26 @@ class TurtleUsHkStrategy(StrategyTemplate):
         short_gross: float = 0.0
         total_gross: float = 0.0
 
+        # 实盘以券商持仓为准，并取「成本 / 市值」中较大者，宁可少开不可超限
+        live: bool = bool(getattr(self, "live_mode", False))
+        positions: Dict[str, int] = self._authoritative_positions() if live else {}
+
         for vt_symbol in self.vt_symbols:
-            pos: int = int(self.get_pos(vt_symbol))
+            pos: int = int(positions.get(vt_symbol, self.get_pos(vt_symbol)))
             price: float = self._price_for_symbol(vt_symbol, bars)
             if not pos or price <= 0:
                 continue
 
+            market_value: float = abs(pos) * price
             if self.use_cost_exposure:
                 cost: float = abs(float(self.cost_basis.get(vt_symbol, 0.0)))
                 # cost_basis 为空（重启后成本基准丢失）时必须回退市值，
                 # 否则已用敞口被算成 0，闸门等于完全失效。
-                value: float = cost if cost else abs(pos) * price
+                value: float = cost if cost else market_value
+                if live:
+                    value = max(value, market_value)
             else:
-                value = abs(pos) * price
+                value = market_value
 
             total_gross += value
             if pos > 0:
@@ -3420,7 +4346,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
             cursor -= timedelta(days=1)
         return count
 
-    def _check_data_stale(self) -> bool:
+    def _check_data_stale(self, vt_symbol: str | None = None) -> bool:
         """检查历史日线是否陈旧（防止数据缺口导致假突破）。
 
         数据库缺交易日时，启动回放的历史日线会停在缺口之前，ENTRYUP 与
@@ -3431,41 +4357,95 @@ class TurtleUsHkStrategy(StrategyTemplate):
             上一个工作日）—— 精确覆盖周末与单日假期；
           · 自然日缺口 > max_daily_gap_days —— 兜底超长缺口。
         max_daily_gap_days = 0 表示整体关闭检查。
+
+        vt_symbol 给出时按该标的自己的最近日K判断（单只缺数不会被组合
+        最大日期掩盖）；港股按交易日历计数（节假日后首日不误封）。
+        初始化回放期间（trading=False）不判断：此时日期在逐日推进，必然「陈旧」。
         """
         if not self.live_mode or self.max_daily_gap_days <= 0:
             return False
-        if self._last_daily_date is None:
+        if not getattr(self, "trading", True):
             return False
 
-        today: date = datetime.now().date()
-        gap_days: int = (today - self._last_daily_date).days
-        if gap_days < 1:
+        last: date | None = None
+        if vt_symbol:
+            last = self._state_dict("_last_daily_dates").get(vt_symbol)
+        if last is None:
+            last = self._last_daily_date
+        if last is None:
             return False
 
-        weekday_gap: int = self._count_weekdays(today, self._last_daily_date)
-        stale: bool = (
-            weekday_gap > self.max_daily_gap_weekdays
-            or gap_days > self.max_daily_gap_days
-        )
+        today: date = self._today()
+        gap_days: int = (today - last).days
+        stale: bool = False
+        trading_gap: int = 0
+        if gap_days >= 1:
+            trading_gap = self._count_trading_gap(today, last, vt_symbol)
+            stale = (
+                trading_gap > self.max_daily_gap_weekdays
+                or gap_days > self.max_daily_gap_days
+            )
+
+        logged: set = self._state_set("_data_stale_logged_symbols")
+        key: str = vt_symbol or "*"
         if not stale:
+            logged.discard(key)
+            if key == "*":
+                self._data_stale_logged = False
             return False
 
-        if not self._data_stale_logged:
-            self._data_stale_logged = True
-            self.write_log(
-                f"[数据] 历史日线停在 {self._last_daily_date}"
-                f"（缺 {weekday_gap} 个工作日 / 自然日 {gap_days} 天），"
-                "已禁止新开仓；请补齐缺失的分钟线后重启策略"
+        if key not in logged and not (key == "*" and self._data_stale_logged):
+            logged.add(key)
+            if key == "*":
+                self._data_stale_logged = True
+            self._alert(
+                "WARN",
+                f"data_stale_{key}",
+                f"[数据] {vt_symbol or '组合'} 历史日线停在 {last}"
+                f"（缺 {trading_gap} 个交易日/工作日，自然日 {gap_days} 天），"
+                "已禁止新开仓；请补齐缺失的分钟线后重启策略",
             )
         return True
 
+    def _count_trading_gap(self, today: date, last: date, vt_symbol: str | None) -> int:
+        """(last, today] 之间的交易日数：港股用交易日历，其他市场按工作日。"""
+        is_hk: bool = (vt_symbol or "").endswith(".SEHK") or (
+            not vt_symbol and self._hk_symbols_only()
+        )
+        calendar = _hk_calendar() if is_hk else None
+        if calendar is not None and calendar.is_covered(today):
+            return calendar.count_trading_days(today, last)
+        return self._count_weekdays(today, last)
+
     def _block_new_open_if_data_stale(self, plans: List[dict]) -> None:
-        """数据陈旧时把「新增敞口」计划清零，平仓与减仓不受影响。"""
-        if not self._check_data_stale():
-            return
+        """数据陈旧时把「新增敞口」计划清零（逐标的判断），平仓与减仓不受影响。"""
         for p in plans:
-            if p["is_open"] and p["diff"]:
+            if p["is_open"] and p["diff"] and self._check_data_stale(p.get("vt_symbol")):
                 p["diff"] = 0
+
+    def _block_new_open_by_guards(self, plans: List[dict]) -> None:
+        """实盘账户级前置条件不满足时禁止新开仓（平仓不受影响）。"""
+        if not self.live_mode:
+            return
+        reasons: List[str] = []
+        if self.account_balance <= 0:
+            reasons.append("尚未收到目标账户净值")
+        if getattr(self, "_capital_mismatch", False):
+            reasons.append("capital 与账户净值不一致")
+        if getattr(self, "_state_write_failed", False):
+            reasons.append("状态文件连续写入失败")
+        silent: set = self._state_set("_silent_symbols")
+        blocked: bool = False
+        for p in plans:
+            if not (p["is_open"] and p["diff"]):
+                continue
+            if reasons or p.get("vt_symbol") in silent:
+                p["diff"] = 0
+                blocked = True
+        if blocked and reasons:
+            self._log_throttled(
+                "open_guard", "[保护] 已拦截新开仓：" + "；".join(reasons), 600
+            )
 
     def _pretrade_cash_gate(self, plans: List[dict], bars: Dict[str, BarData]) -> None:
         """下单前账户可用资金 / 当日亏损保护。平仓、减仓永不拦截。"""
@@ -3489,7 +4469,15 @@ class TurtleUsHkStrategy(StrategyTemplate):
         if self.max_order_cash_ratio <= 0:
             return
 
+        # 不使用融资：买单额度取「可用资金」与「现金 = 净值 − 多头市值」的较小者。
+        # IB 的 AvailableFunds 含融资额度，E-1 正是靠它买成了 1.66 倍敞口。
         available: float = float(self.account_available or 0.0)
+        if self.account_balance > 0:
+            long_value: float = 0.0
+            for vt_symbol, pos in self._authoritative_positions().items():
+                if pos > 0:
+                    long_value += pos * max(self._price_for_symbol(vt_symbol, bars), 0.0)
+            available = min(available, max(0.0, self.account_balance - long_value))
         ratio: float = max(0.0, min(1.0, self.max_order_cash_ratio))
         if self.min_margin_buffer > 0:
             ratio = min(ratio, 1.0 - self.min_margin_buffer)
@@ -3514,46 +4502,56 @@ class TurtleUsHkStrategy(StrategyTemplate):
             else:
                 used += need
 
-        if self.funds_blocked and not getattr(self, "_funds_logged", False):
-            self.write_log(
-                f"[资金] 可用资金/当日亏损限制触发：available={available:,.2f}, "
-                f"买单额度={limit:,.2f}，已拦截新增买单"
+        if self.funds_blocked:
+            # 旧实现按「上一轮是否拦截」复位标记，不同标的 bar 交替时每分钟刷屏
+            self._log_throttled(
+                "funds_blocked",
+                f"[资金] 可用资金/当日亏损限制触发：现金额度={available:,.2f}, "
+                f"买单额度={limit:,.2f}，已拦截新增买单",
+                600,
             )
-            self._funds_logged = True
-        elif not self.funds_blocked:
-            self._funds_logged = False
 
     def send_orders(self, bars: Dict[str, BarData]) -> None:
         """发送委托：故障安全 → 信号裁剪 → 账户级风控 → 订单账本发单。"""
         close_only: bool = self.close_only
+        blocked: bool = bool(self._trading_blocked)
+        hold: Dict[str, str] = self._state_dict("_hold_symbols")
 
-        # 持仓不一致：允许 close_only 用券商持仓减仓；否则完全阻断新增风险。
-        if self._trading_blocked and not close_only:
-            if not self._block_logged:
-                self.write_log("[对账] 交易已被持仓校验拦截，不会发送任何新委托")
-                self._block_logged = True
-            return
-
-        # block_new_orders 是全冻结；应急清仓由 on_bars 的独立路径覆盖。
+        # block_new_orders 是人工全冻结开关（含止损）；应急清仓由 on_bars 独立路径覆盖。
         if self.block_new_orders:
             if not self._block_logged:
-                self.write_log("[保护] block_new_orders=true，暂停发送新委托")
+                self.write_log(
+                    "[保护] block_new_orders=true，暂停发送一切新委托（含止损）；"
+                    "只想禁止开仓请改用 close_only"
+                )
                 self._block_logged = True
             return
         self._block_logged = False
 
-        # close_only 时以券商净持仓为权威，避免本地状态错误继续发单。
+        # 持仓校验未通过：不再全冻结（E-3：那会连止损都发不出），
+        # 改为全部标的进入持有保护——禁止开仓/加仓，止损/离场照常。
+        if blocked:
+            self._log_throttled(
+                "trading_blocked",
+                "[对账] 持仓校验未通过：禁止开仓/加仓，止损/离场按券商持仓照常执行",
+                1800,
+            )
+
+        # close_only / 持有保护时以券商净持仓为权威，避免本地状态错误继续发单。
+        use_broker: bool = close_only or blocked or bool(hold)
         authoritative: Dict[str, int] = (
-            self._authoritative_positions() if close_only else {}
+            self._authoritative_positions() if use_broker else {}
         )
         plans: List[dict] = []
+        risk_equity: float = self._risk_equity() if self.live_mode else 0.0
 
         # 阶段一：收集计划 + 新开仓缩放 + 单标权重裁剪
         for vt_symbol, bar in bars.items():
             target: int = self.targets[vt_symbol]
+            guarded: bool = blocked or vt_symbol in hold
             pos: int = (
                 authoritative.get(vt_symbol, self.get_pos(vt_symbol))
-                if close_only
+                if (close_only or guarded)
                 else self.get_pos(vt_symbol)
             )
             lot_size: int = int(self.lot_sizes.get(vt_symbol, 1)) or 1
@@ -3563,7 +4561,15 @@ class TurtleUsHkStrategy(StrategyTemplate):
             if self._block_pending_reconcile_liquidation(vt_symbol, pos, target):
                 continue
 
-            if close_only:
+            if vt_symbol in hold and pos == 0 and target == 0:
+                hold.pop(vt_symbol, None)
+                self.write_log(f"[对账] {vt_symbol} 已清仓，解除持有保护")
+                guarded = blocked
+
+            if guarded:
+                # 持有保护：不加仓、也不按目标自动减仓；状态机给出止损/离场才全平
+                target = 0 if target == 0 else pos
+            elif close_only:
                 # 只允许减少 |pos|，不允许反向或新增敞口。
                 if pos > 0:
                     target = max(0, min(target, pos))
@@ -3717,6 +4723,22 @@ class TurtleUsHkStrategy(StrategyTemplate):
 
             diff: int = int((target - pos) / lot_size) * lot_size
 
+            # 已超出单票权重上限的持仓：权重裁剪会阻止继续加仓，这里只负责提示人工处理
+            if (
+                self.live_mode
+                and pos
+                and price > 0
+                and risk_equity > 0
+                and self.max_symbol_weight > 0
+                and abs(pos) * price / risk_equity > self.max_symbol_weight * 1.2
+            ):
+                self._log_throttled(
+                    f"overweight_{vt_symbol}",
+                    f"[风控] {vt_symbol} 持仓权重 {abs(pos) * price / risk_equity:.0%}"
+                    f" 超过上限 {self.max_symbol_weight:.0%}，已禁止加仓；不自动减仓，请人工处理",
+                    3600,
+                )
+
             # 排名分：做多按偏离度降序（越强越优先）；
             # 做空按「接近 MA60」排序（刚跌破的优先，与候选筛选保持一致）
             dev: float = self.deviation.get(vt_symbol, 0.0)
@@ -3739,6 +4761,8 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # 数据陈旧时只允许平仓/减仓：历史日线缺口会让 ENTRYUP 过期，
         # 价格越过旧通道会被误判为突破（2026-11-20 小米假突破即此原因）。
         self._block_new_open_if_data_stale(plans)
+        # 账户净值未到 / capital 口径错误 / 状态写盘失败 / 行情静默：禁止新开仓
+        self._block_new_open_by_guards(plans)
         self._pretrade_cash_gate(plans, bars)
 
         # 阶段三：所有委托统一走订单账本，保证唯一意图 ID 与幂等。
