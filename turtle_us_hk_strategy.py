@@ -1133,7 +1133,9 @@ class TurtleUsHkStrategy(StrategyTemplate):
                     self._prepare_corporate_actions({vt_symbol: dbar})
                     self.on_daily_bars({vt_symbol: dbar})
                 else:
-                    signal.update_daily_bar(dbar)
+                    signal.update_daily_bar(
+                        dbar, bool(getattr(self, "pos_data", {}).get(vt_symbol, 0))
+                    )
 
             if daily:
                 last_day = daily[-1].datetime.date()
@@ -3750,7 +3752,9 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 return
         for vt_symbol, bar in bars.items():
             signal: TurtleSignal = self.signals[vt_symbol]
-            signal.update_daily_bar(bar)
+            signal.update_daily_bar(
+                bar, bool(getattr(self, "pos_data", {}).get(vt_symbol, 0))
+            )
 
             # 记录最近一根日K的交易日，供数据新鲜度闸门判断缺口（组合 + 逐标的）
             bar_date: date = bar.datetime.date()
@@ -5131,9 +5135,9 @@ class TurtleSignal:
         # 获取状态机目标仓位
         self.target = int(self.machine.target * self.unit)
 
-    def update_daily_bar(self, bar: BarData) -> None:
-        """日K线推送"""
-        self.machine.commit_daily(bar)
+    def update_daily_bar(self, bar: BarData, has_position: bool | None = None) -> None:
+        """日K线推送；has_position 为真实持仓，决定入场通道与 N 是否冻结。"""
+        self.machine.commit_daily(bar, has_position)
 
     def get_target(self) -> int:
         """获取信号"""
