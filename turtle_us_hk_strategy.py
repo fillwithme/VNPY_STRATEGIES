@@ -354,6 +354,9 @@ class TurtleUsHkStrategy(StrategyTemplate):
     cci_window: int = 14            # CCI周期
     cci_signal: int = 20            # CCI信号阈值
     n_window: int = 20              # N值（ATR）周期
+    use_corporate_actions: bool = False
+    corporate_actions_file: str = ""
+    corporate_actions_allow_partial: bool = False
     unit_limit: int = 4             # 最大开仓级别
     trading_size: int = 1           # 每级别交易手数
     price_add_ticks: int = 8        # 超价 = price_add_ticks * pricetick（price_add_pct=0 时生效）
@@ -540,6 +543,9 @@ class TurtleUsHkStrategy(StrategyTemplate):
         "cci_window",
         "cci_signal",
         "n_window",
+        "use_corporate_actions",
+        "corporate_actions_file",
+        "corporate_actions_allow_partial",
         "unit_limit",
         "trading_size",
         "price_add_ticks",
@@ -741,6 +747,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 self.risk_levels.get(vt_symbol, self.risk_level),
                 machine
             )
+            self.signals[vt_symbol].corporate_action_unit_frozen = self.use_corporate_actions
 
         # 初始化目标字典
         self.targets: Dict[str, int] = {}
@@ -926,6 +933,17 @@ class TurtleUsHkStrategy(StrategyTemplate):
         is_backtest: bool = isinstance(self.strategy_engine, BacktestingEngine)
         self.live_mode = not is_backtest
         self._load_universe()
+        if self.use_corporate_actions:
+            from corporate_actions import DEFAULT_ACTION_FILE, ActionBook
+
+            self._ca_book = ActionBook(self.corporate_actions_file or DEFAULT_ACTION_FILE)
+            if self.live_mode:
+                today = datetime.now(_HK_TZ).date()
+                errors = self._ca_book.coverage_errors(self.vt_symbols, today - timedelta(days=400), today)
+                if self.corporate_actions_allow_partial or errors or self._ca_book.data_basis.get("status") != "complete":
+                    raise ValueError("实盘公司行动/行情口径未完整核验，禁止启用时点复权")
+            elif not getattr(self.strategy_engine, "ca_raw_prices", False):
+                raise ValueError("时点复权回测必须使用 CorporateActionBacktestingEngine 的原价输入")
 
         if self.init_load_days > 0:
             days: int = self.init_load_days
@@ -982,7 +1000,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
             self._log_version_info()
 
         # P0-3：优先恢复上次退出时的状态机状态（防断线重启后"失忆"）
-        if self.use_state_persist:
+        if self.use_state_persist and (self.live_mode or not self.use_corporate_actions):
             self._load_state()
 
         # 实盘：非持有标的的状态机回到空仓 + 最新通道（回放的模拟持仓不算数）
@@ -1090,15 +1108,47 @@ class TurtleUsHkStrategy(StrategyTemplate):
             if not bars:
                 continue
 
+            if self.use_corporate_actions:
+                from corporate_actions import map_raw_bar
+
+                bars = [map_raw_bar(item, self._ca_book) for item in bars]
+                self._state_dict("_ca_dates").pop(vt_symbol, None)
+                self._state_dict("_ca_raw_closes").pop(vt_symbol, None)
+                self._state_dict("_last_daily_dates").pop(vt_symbol, None)
+                for event in self._ca_book.actions:
+                    if event.vt_symbol == vt_symbol:
+                        self._state_dict("_ca_factors").pop(event.id, None)
+                for name in ("opens", "highs", "lows", "closes", "volumes"):
+                    getattr(signal.machine.buf, name).clear()
+                signal.machine.target = 0
+                signal.machine.n = 0.0
+                signal.target = signal.unit = 0
+                self.daily_closes.pop(vt_symbol, None)
+                self.daily_hlc.pop(vt_symbol, None)
             daily = self._aggregate_daily_bars(vt_symbol, bars)
+            if self.use_corporate_actions:
+                daily = [item for item in daily if item.datetime.date() < self._hk_now().date()]
             for dbar in daily:
-                signal.update_daily_bar(dbar)
+                if self.use_corporate_actions:
+                    self._prepare_corporate_actions({vt_symbol: dbar})
+                    self.on_daily_bars({vt_symbol: dbar})
+                else:
+                    signal.update_daily_bar(dbar)
 
             if daily:
                 last_day = daily[-1].datetime.date()
                 if self._last_daily_date is None or last_day > self._last_daily_date:
                     self._last_daily_date = last_day
                 self._state_dict("_last_daily_dates")[vt_symbol] = last_day
+                if self.use_corporate_actions:
+                    for name in ("daily_bars", "bars", "last_ticks"):
+                        values = getattr(self.pbg, name, {})
+                        old = values.get(vt_symbol)
+                        if old is not None and old.datetime.date() <= last_day:
+                            values.pop(vt_symbol, None)
+                    last_ticks = getattr(self.pbg, "_last_tick_dt", {})
+                    if vt_symbol in last_ticks and last_ticks[vt_symbol].date() <= last_day:
+                        last_ticks.pop(vt_symbol)
 
             self.write_log(
                 f"[预热] {vt_symbol} 日线 {len(daily)} 根，"
@@ -2111,6 +2161,8 @@ class TurtleUsHkStrategy(StrategyTemplate):
 
     def _save_state(self) -> None:
         """持久化状态机、订单账本、交易任务与风控锚点（schema v2）。"""
+        if getattr(self, "_ca_preparing", False) or getattr(self, "_ca_prepare_error", None) is not None:
+            return
         # on_start 加载完状态之前不写盘：初始化回放期间的快照是「历史中途」状态，
         # 写下去会覆盖上次的有效状态（E-2）。测试用的裸对象没有该字段，按已就绪处理。
         if not getattr(self, "_state_ready", True):
@@ -2147,6 +2199,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 "traded": bool(machine.traded),
                 "rebase_next_add": bool(getattr(machine, "rebase_next_add", False)),
             }
+            if self.use_corporate_actions:
+                anchor = self._state_dict("_ca_dates").get(vt_symbol)
+                data[vt_symbol]["price_anchor"] = anchor.isoformat() if anchor else None
+                data[vt_symbol]["unit"] = signal.unit
 
         data["_meta"] = {
             "schema_version": self.STATE_SCHEMA_VERSION,
@@ -2155,6 +2211,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
             "saved_at": datetime.now().isoformat(),
             "baseline_equity": float(self._baseline_equity),
         }
+        if self.use_corporate_actions:
+            data["_meta"]["corporate_actions"] = {
+                "basis": "asof_raw_v1", "sha256": self._ca_book.sha256,
+            }
 
         data["_runtime"] = {
             "order_ledger": self.order_ledger,
@@ -2235,6 +2295,8 @@ class TurtleUsHkStrategy(StrategyTemplate):
 
         meta: dict = data.pop("_meta", {}) or {}
         runtime: dict = data.pop("_runtime", {}) or {}
+        if meta.get("corporate_actions") and not self.use_corporate_actions:
+            raise ValueError("快照为 as-of 口径，当前关闭复权；必须人工迁移后再启动")
         schema_version: int = int(meta.get("schema_version", 1) or 1)
         legacy: bool = schema_version < self.STATE_SCHEMA_VERSION
 
@@ -2286,6 +2348,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 machine.entry_down = float(fields.get("entry_down", 0.0))
                 machine.exit_up = float(fields.get("exit_up", 0.0))
                 machine.exit_down = float(fields.get("exit_down", 0.0))
+                self._restore_corporate_action_state(vt_symbol, fields, meta)
                 self._state_set("_restored_held").add(vt_symbol)
             elif saved_target != 0:
                 skipped.append(vt_symbol)
@@ -2325,6 +2388,8 @@ class TurtleUsHkStrategy(StrategyTemplate):
             self.fill_volumes = dict(runtime.get("fill_volumes", {}) or {})
             self.fill_records = list(runtime.get("fill_records", []) or [])
             self.prev_prices = dict(runtime.get("prev_prices", {}) or {})
+            if self.use_corporate_actions:
+                self.prev_prices.update(self._state_dict("_ca_raw_closes"))
             self.safety_mode = str(runtime.get("safety_mode", "normal"))
             self.funds_blocked = bool(runtime.get("funds_blocked", False))
             self._invalid_tick_count = int(
@@ -2455,7 +2520,13 @@ class TurtleUsHkStrategy(StrategyTemplate):
 
         prev_tick: TickData | None = self.pbg.last_ticks.get(tick.vt_symbol)
         if prev_tick and prev_tick.last_price > 0 and self.price_max_jump_pct > 0:
-            jump: float = abs(price - prev_tick.last_price) / prev_tick.last_price
+            reference = prev_tick.last_price
+            if self.use_corporate_actions:
+                from corporate_actions import trading_date
+
+                for event in self._ca_book.between(tick.vt_symbol, trading_date(prev_tick.datetime), trading_date(dt)):
+                    reference *= event.factor(self._state_dict("_ca_raw_closes")[tick.vt_symbol])
+            jump: float = abs(price - reference) / reference
             pending: Dict[str, list] = self._state_dict("_jump_pending")
             if jump > self.price_max_jump_pct:
                 # 参考价只随被接受的 tick 更新：真实跳空（复牌/除权/暴跌）后若一直拒收，
@@ -3444,6 +3515,8 @@ class TurtleUsHkStrategy(StrategyTemplate):
             # 不能再提交成一根「额外的一天」（否则通道周期被压缩）
             last: date | None = committed.get(vt_symbol)
             if last is not None and daily_bar.datetime.date() <= last:
+                if self.use_corporate_actions:
+                    daily_bars[vt_symbol] = None
                 continue
             daily_bar.datetime = daily_bar.datetime.replace(
                 hour=0, minute=0, second=0, microsecond=0
@@ -3452,6 +3525,110 @@ class TurtleUsHkStrategy(StrategyTemplate):
             daily_bars[vt_symbol] = None
         if finished:
             self.on_daily_bars(finished)
+
+    def _prepare_corporate_actions(self, bars: Dict[str, BarData]) -> None:
+        if not self.use_corporate_actions:
+            return
+        if getattr(self, "_ca_prepare_error", None) is not None:
+            raise RuntimeError("公司行动准备失败，禁止在部分调整的状态上重试；须重新初始化") from self._ca_prepare_error
+        preparing = getattr(self, "_ca_preparing", False)
+        self._ca_preparing = True
+        try:
+            self._apply_corporate_actions(bars)
+        except Exception as exc:
+            self._ca_prepare_error = exc
+            raise
+        finally:
+            self._ca_preparing = preparing
+
+    def _apply_corporate_actions(self, bars: Dict[str, BarData]) -> None:
+        from corporate_actions import trading_date
+
+        dates = self._state_dict("_ca_dates")
+        closes = self._state_dict("_ca_raw_closes")
+        factors = self._state_dict("_ca_factors")
+        for symbol, bar in bars.items():
+            day = trading_date(bar.datetime)
+            previous = dates.get(symbol)
+            if previous and day < previous:
+                raise ValueError(f"{symbol}: 公司行动输入时间倒退")
+            if previous != day:
+                self._ca_book.require_resolved(symbol, previous, day)
+            events = self._ca_book.between(symbol, previous, day) if previous and day > previous else []
+            for event in events:
+                if event.ex_date != day:
+                    raise ValueError(f"{symbol}: 缺失除权日 {event.ex_date} 数据，不能猜测分红前收")
+                factor = event.factor(closes[symbol])
+                signal = self.signals[symbol]
+                new_unit = signal.unit * event.share_ratio
+                if abs(new_unit - round(new_unit)) > 1e-8:
+                    raise ValueError(f"{event.id}: 每级股数出现不足一股，需现金替代/碎股规则")
+                signal.machine.apply_adjustment(factor, event.share_ratio)
+                signal.unit = int(round(new_unit))
+                signal.target = int(round(signal.target * event.share_ratio))
+                for name in ("daily_closes",):
+                    values = getattr(self, name, {}).get(symbol)
+                    if values is not None:
+                        updated = [value * factor for value in values]
+                        values.clear()
+                        values.extend(updated)
+                values = getattr(self, "daily_hlc", {}).get(symbol)
+                if values is not None:
+                    updated = [tuple(value * factor for value in hlc) for hlc in values]
+                    values.clear()
+                    values.extend(updated)
+                if symbol in self.prev_prices:
+                    self.prev_prices[symbol] *= factor
+                if event.new_lot_size:
+                    self.lot_sizes = dict(self.lot_sizes)
+                    self.lot_sizes[symbol] = event.new_lot_size
+                    signal.lot_size = event.new_lot_size
+                daily = getattr(self.pbg, "daily_bars", {})
+                if daily.get(symbol) and trading_date(daily[symbol].datetime) < day:
+                    daily[symbol] = None
+                if self.live_mode:
+                    # 持仓和现金由 IB 回报更新；不自行重复调整券商账本。
+                    self._target_reconciled = False
+                    if getattr(self, "active_orderids", None):
+                        self._cancel_orders_for_bars({symbol: bar})
+                factors[event.id] = [factor, event.share_ratio]
+                self.write_log(f"[公司行动] {event.id} 价格因子={factor:.8f} 股数比例={event.share_ratio:g}")
+            dates[symbol] = day
+            closes[symbol] = bar.close_price
+
+    def _restore_corporate_action_state(self, symbol: str, fields: dict, meta: dict) -> None:
+        if not self.use_corporate_actions:
+            return
+        saved = meta.get("corporate_actions", {})
+        if saved.get("basis") != "asof_raw_v1" or saved.get("sha256") != self._ca_book.sha256:
+            raise ValueError("持仓快照缺少时点价格锚点，或行动表已变更；须人工迁移，不恢复旧坐标")
+        anchor = fields.get("price_anchor")
+        current = self._state_dict("_ca_dates").get(symbol)
+        if not anchor or current is None or date.fromisoformat(anchor) > current:
+            raise ValueError(f"{symbol}: 缺失/超前价格锚点，不能恢复冻结状态")
+        signal = self.signals[symbol]
+        unit = float(fields.get("unit", 0))
+        if not np.isfinite(unit) or unit <= 0 or unit != round(unit):
+            raise ValueError(f"{symbol}: 快照每级真实股数无效")
+        factor_product, ratio_product = 1.0, 1.0
+        known = self._state_dict("_ca_factors")
+        for event in self._ca_book.between(symbol, date.fromisoformat(anchor), current):
+            if event.id not in known:
+                raise ValueError(f"{event.id}: 预热区间未提供迁移因子，须扩展历史或人工迁移")
+            factor, ratio = known[event.id]
+            unit *= ratio
+            if not np.isfinite(unit) or abs(unit - round(unit)) > 1e-8:
+                raise ValueError(f"{event.id}: 恢复后的每级股数不足一股，需人工迁移")
+            factor_product *= factor
+            ratio_product *= ratio
+        signal.machine.apply_adjustment(factor_product, ratio_product, include_buffer=False)
+        signal.unit = int(round(unit))
+        signal.target = int(signal.machine.target * signal.unit)
+        machine = signal.machine
+        if machine.formula is not None and len(machine.buf) >= machine.min_bars:
+            out = machine.formula.run(machine.buf.to_df(), **machine.formula_params)
+            machine.exit_up = float(out["EXITUP"].iloc[-1])
+            machine.exit_down = float(out["EXITDOWN"].iloc[-1])
 
     def _request_global_cancel(self) -> None:
         """应急兜底：让 IB 撤销本账户全部活动委托（不依赖本地委托记录）。"""
@@ -3474,6 +3651,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
         """原始K线推送"""
         if not bars:
             return
+        if self.use_corporate_actions and self.live_mode and not self.trading:
+            from corporate_actions import map_raw_bar
+
+            bars = {symbol: map_raw_bar(item, self._ca_book) for symbol, item in bars.items()}
 
         bar: BarData = list(bars.values())[0]
         self._last_bar_time = bar.datetime.isoformat()
@@ -3483,7 +3664,23 @@ class TurtleUsHkStrategy(StrategyTemplate):
 
         # 上一交易日没有 daily_end 那一分钟的 bar（无成交 / 半日市）：
         # 先提交它，再用新通道计算今天的第一根 bar，避免两天合成一根日K。
-        self._commit_stale_daily_bars(bars)
+        if self.use_corporate_actions:
+            if getattr(self, "_ca_prepare_error", None) is not None:
+                raise RuntimeError("公司行动准备失败，须重新初始化") from self._ca_prepare_error
+            previous_events = len(self._state_dict("_ca_factors"))
+            self._ca_preparing = True
+            try:
+                self._commit_stale_daily_bars(bars)
+                self._prepare_corporate_actions(bars)
+            except Exception as exc:
+                self._ca_prepare_error = exc
+                raise
+            finally:
+                self._ca_preparing = False
+            if len(self._state_dict("_ca_factors")) > previous_events and self.use_state_persist and self.live_mode and self.trading:
+                self._save_state()
+        else:
+            self._commit_stale_daily_bars(bars)
 
         # 断线保护：重连 + 委托恢复 + 持仓一致后自动解除（定时器也会检查）
         if self.live_mode and self.trading:
@@ -3545,6 +3742,12 @@ class TurtleUsHkStrategy(StrategyTemplate):
 
     def on_daily_bars(self, bars: Dict[str, BarData]):
         """日K线推送"""
+        if self.use_corporate_actions:
+            committed = self._state_dict("_last_daily_dates")
+            bars = {symbol: item for symbol, item in bars.items()
+                    if symbol not in committed or item.datetime.date() > committed[symbol]}
+            if not bars:
+                return
         for vt_symbol, bar in bars.items():
             signal: TurtleSignal = self.signals[vt_symbol]
             signal.update_daily_bar(bar)
@@ -4887,6 +5090,8 @@ class TurtleSignal:
         ):
             return 0
 
+        if getattr(self, "corporate_action_unit_frozen", False) and self.target and self.unit > 0:
+            return self.unit
         unit: float = (self.capital * self.risk_level) / (
             self.machine.n * self.contract_size
         )
