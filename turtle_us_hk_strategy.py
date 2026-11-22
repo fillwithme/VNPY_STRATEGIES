@@ -5017,6 +5017,22 @@ class TurtleUsHkStrategy(StrategyTemplate):
                     3600,
                 )
 
+            # 有信号却买不进（不足一手 / 预算或资金不足）：状态机必须回退空仓。
+            # 否则 machine.target 停在非零、commit_daily 不再刷新入场通道与 N，
+            # 该标的会被永久冻结在「以为持有」的状态（回测尤其致命）。
+            signal = getattr(self, "signals", {}).get(vt_symbol)
+            machine = getattr(signal, "machine", None)
+            if target == 0 and pos == 0 and machine is not None and machine.target:
+                desired: int = int(self.targets[vt_symbol])
+                machine.target = 0
+                self._log_throttled(
+                    f"no_open_{vt_symbol}",
+                    f"[信号] {vt_symbol} 目标 {desired} 股（每手 {lot_size} 股，"
+                    f"一手约 {price * lot_size:,.0f}），按预算/权重/资金裁剪后为 0 股，"
+                    "本轮不建仓；状态机已回退空仓，下一交易日重算通道",
+                    3600,
+                )
+
             # 排名分：做多按偏离度降序（越强越优先）；
             # 做空按「接近 MA60」排序（刚跌破的优先，与候选筛选保持一致）
             dev: float = self.deviation.get(vt_symbol, 0.0)
