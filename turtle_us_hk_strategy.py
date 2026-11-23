@@ -137,6 +137,7 @@ turtle_us_hk_strategy.py - 美股/港股通用海龟组合策略
    超价用 get_pricetick()。
 """
 
+import csv
 import json
 import os
 import shutil
@@ -1220,6 +1221,75 @@ class TurtleUsHkStrategy(StrategyTemplate):
         stamps[key] = now
         self.write_log(msg)
         return True
+
+    def _record_signal_blocked(
+        self,
+        vt_symbol: str,
+        day: date,
+        price: float,
+        desired: int,
+        target: int,
+        pos: int,
+        reason: str,
+    ) -> None:
+        """P0 诊断：有信号却最终没下单时，按「标的×交易日」记录一次原因。
+
+        只写诊断（日志 + CSV），不改变任何交易行为。同一标的同一天只记第一条，
+        因此看到的是当天最先生效的原因。
+        """
+        try:
+            key = f"{day.isoformat()}|{vt_symbol}"
+            seen = self._state_set("_blocked_probe_seen")
+            if key in seen:
+                return
+            seen.add(key)
+        except Exception:
+            key = ""
+        lot: int = int(self.lot_sizes.get(vt_symbol, 1)) or 1
+        signal = getattr(self, "signals", {}).get(vt_symbol)
+        level: int = int(getattr(getattr(signal, "machine", None), "target", 0) or 0)
+        if not self.fills_dir:
+            self._log_throttled(
+                f"no_open_{vt_symbol}_{reason}",
+                f"[信号] {vt_symbol} 目标 {desired} 股、每手 {lot} 股，未下单：{reason}（级别 {level}）",
+                3600,
+            )
+            return
+        try:
+            base = Path(self.fills_dir)
+            base.mkdir(parents=True, exist_ok=True)
+            path = base / "signal_blocked.csv"
+            new: bool = not path.exists()
+            with path.open("a", encoding="utf-8-sig", newline="") as stream:
+                writer = csv.writer(stream)
+                if new:
+                    writer.writerow(["date", "vt_symbol", "desired", "target", "pos", "price",
+                                     "lot", "lot_value", "reason", "level"])
+                writer.writerow([day.isoformat(), vt_symbol, desired, target, pos,
+                                 f"{price:.4f}", lot, f"{price * lot:.0f}", reason, level])
+        except OSError as exc:
+            self._log_throttled("blocked_csv", f"[诊断] 写 signal_blocked.csv 失败: {exc}", 3600)
+        self._log_throttled(
+            f"no_open_{vt_symbol}_{reason}",
+            f"[信号] {vt_symbol} 目标 {desired} 股、每手 {lot} 股（一手约 {price * lot:,.0f}），"
+            f"未下单：{reason}（级别 {level}）",
+            3600,
+        )
+
+    def _record_plan_blocked(self, plan: dict, reason: str) -> None:
+        """阶段二门禁的薄封装：计划里可能缺诊断字段，缺少标的就跳过。"""
+        vt_symbol = plan.get("vt_symbol")
+        if not vt_symbol:
+            return
+        self._record_signal_blocked(
+            str(vt_symbol),
+            plan.get("day") or self._today(),
+            float(plan.get("price", 0.0) or 0.0),
+            int(plan.get("desired", 0) or 0),
+            int(plan.get("target", 0) or 0),
+            int(plan.get("pos", 0) or 0),
+            reason,
+        )
 
     def _alert(self, level: str, key: str, msg: str) -> None:
         """写日志并推送外部告警（level: INFO / WARN / CRIT；去重由告警模块负责）。"""
@@ -4612,6 +4682,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 else:
                     budget -= need
 
+        for p in plans:
+            if p["is_open"] and not p["diff"] and p.get("desired"):
+                self._record_plan_blocked(p, "exposure")
+
     @staticmethod
     def _count_weekdays(later: date, earlier: date, limit: int = 60) -> int:
         """统计 (earlier, later] 之间的工作日数，最多数 limit 个。"""
@@ -4699,6 +4773,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
         for p in plans:
             if p["is_open"] and p["diff"] and self._check_data_stale(p.get("vt_symbol")):
                 p["diff"] = 0
+                self._record_plan_blocked(p, "data_stale")
 
     def _block_new_open_by_guards(self, plans: List[dict]) -> None:
         """实盘账户级前置条件不满足时禁止新开仓（平仓不受影响）。"""
@@ -4719,6 +4794,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
             if reasons or p.get("vt_symbol") in silent:
                 p["diff"] = 0
                 blocked = True
+                self._record_plan_blocked(p, "account_guard")
         if blocked and reasons:
             self._log_throttled(
                 "open_guard", "[保护] 已拦截新开仓：" + "；".join(reasons), 600
@@ -4776,6 +4852,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
             if used + need > limit:
                 p["diff"] = 0
                 self.funds_blocked = True
+                self._record_plan_blocked(p, "cash")
             else:
                 used += need
 
@@ -4843,9 +4920,13 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 self.write_log(f"[对账] {vt_symbol} 已清仓，解除持有保护")
                 guarded = blocked
 
+            veto: str = ""      # P0 诊断：记录本次目标被谁削减
+
             if guarded:
                 # 持有保护：不加仓、也不按目标自动减仓；状态机给出止损/离场才全平
                 target = 0 if target == 0 else pos
+                if target == 0:
+                    veto = "hold_guard"
             elif close_only:
                 # 只允许减少 |pos|，不允许反向或新增敞口。
                 if pos > 0:
@@ -4854,6 +4935,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
                     target = min(0, max(target, pos))
                 else:
                     target = 0
+                veto = "close_only"
 
             # 方向冲突保护：持仓为多、目标为空（或反之）时不做任何操作。
             # 正常平仓目标为 0，不受影响。
@@ -4876,7 +4958,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 # （后续仍受单标权重上限与总敞口上限约束，不会无限放大）
                 if pos == 0 and self.use_risk_budget and self.max_positions > 0:
                     budget_scale: float = self.risk_budget_base / self.max_positions
-                    target = int(target * budget_scale / lot_size) * lot_size
+                    scaled: int = int(target * budget_scale / lot_size) * lot_size
+                    if scaled != target:
+                        veto = "risk_budget"
+                    target = scaled
 
                 # P1-7 固定预算 / P1-15 多空分开预算
                 # 持仓上限越少（弱市），单只预算越大；仍受单标权重与总敞口上限约束
@@ -4904,31 +4989,40 @@ class TurtleUsHkStrategy(StrategyTemplate):
                     budget_shares: int = int(budget / price / lot_size) * lot_size
                     if abs(target) > budget_shares:
                         target = budget_shares if target > 0 else -budget_shares
+                        veto = "fixed_budget"
 
                 if self.new_open_scale <= 0:
                     # 二级熔断：连加仓也禁止，保持现有仓位
                     target = pos
+                    veto = "dd_level2"
                 elif pos == 0 and self.new_open_scale < 1.0:
                     # 一级熔断 / 高波动：仅缩减首次建仓
-                    target = int(target * self.new_open_scale / lot_size) * lot_size
+                    scaled = int(target * self.new_open_scale / lot_size) * lot_size
+                    if scaled != target:
+                        veto = "open_scale"
+                    target = scaled
 
             # 时点股票池：非成员不新开仓（已持仓按原规则离场）
             if is_open and pos == 0 and target != 0:
                 members = self._universe_members(bar.datetime.date())
                 if members is not None and vt_symbol not in members:
                     target = pos
+                    veto = "universe"
 
             # P1-3 + P1-10 自适应选股：按方向检查各自的允许集合
             if is_open and pos == 0 and target != 0 and self.use_trend_filter:
                 if target > 0 and vt_symbol not in self.allowed_long:
                     target = pos
+                    veto = "trend_filter"
                 elif target < 0 and vt_symbol not in self.allowed_short:
                     target = pos
+                    veto = "trend_filter"
 
             # P1-4 ADX 趋势强度过滤：ADX 不足说明无趋势，不开新仓
             if is_open and pos == 0 and target != 0 and self.use_adx_filter:
                 if self.adx_values.get(vt_symbol, 0.0) < self.adx_threshold:
                     target = pos
+                    veto = "adx_filter"
 
             # P1-5 / P1-17 Efficiency Ratio 过滤：
             # 固定阈值（原）或历史分位（自适应，消除牛熊市阈值松紧不一的问题）
@@ -4938,6 +5032,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
                     # P1-18 横截面：当天排名未进入前 (1-er_percentile) 的不开仓
                     if self.er_pass and vt_symbol not in self.er_pass:
                         target = pos
+                        veto = "er_cross_section"
                 elif self.use_er_percentile:
                     # P1-17 时序：与该标的自身历史分位比较
                     hist = self.er_history.get(vt_symbol)
@@ -4950,13 +5045,16 @@ class TurtleUsHkStrategy(StrategyTemplate):
                         )
                         if er_now < threshold:
                             target = pos
+                            veto = "er_percentile"
                 elif er_now < self.er_threshold:
                     target = pos
+                    veto = "er_threshold"
 
             # P1-9 相对强度过滤：跑输市场平均的标的不开新仓
             if is_open and pos == 0 and target != 0 and self.use_rs_filter:
                 if self.rs_values.get(vt_symbol, 0.0) < self.rs_threshold:
                     target = pos
+                    veto = "rs_filter"
 
             # P1-14 空头「反弹过滤」：价格在均线下方（急跌中）不开空，
             # 只在价格站上均线（反弹确认）时开空，避免追在急跌末端被 2N 止损打掉。
@@ -4975,12 +5073,16 @@ class TurtleUsHkStrategy(StrategyTemplate):
                     if price < ma:
                         # 价格仍在均线下方 = 急跌中，不追空
                         target = pos
+                        veto = "short_rebound"
 
             # 权重裁剪仅作用于首次建仓（pos==0），加仓不受单标权重上限约束。
             # 2026-11-22 按要求恢复 aad4641 之前的旧写法（复现 419% 基线），
             # 影响见 README_OPTIMIZE_PLAN.md 附录 C.6。
             if is_open and pos == 0:
-                target = self._cap_target_by_weight(vt_symbol, target, price)
+                capped: int = self._cap_target_by_weight(vt_symbol, target, price)
+                if capped != target:
+                    veto = "symbol_weight"
+                target = capped
 
             # P1-8 单笔加仓金额上限：价格跳空触发多个加仓档位时，拆成多笔买入，
             # 避免在 1.5N 处一次性买满（海龟原版应在 0.5N / 1.0N / 1.5N 分批）
@@ -4988,6 +5090,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 addon_cap: int = int(self.max_addon_amount / price / lot_size) * lot_size
                 if target - pos > addon_cap:
                     target = pos + addon_cap
+                    veto = "addon_cap"
 
             # P1-11 做空单日加仓级数上限：每天最多加 N 级，避免跳空时一天打满 4 级
             if (
@@ -5002,6 +5105,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
                     max_add: int = unit_shares * self.max_short_addon_level
                     if pos - target > max_add:
                         target = pos - max_add
+                        veto = "short_addon_cap"
 
             diff: int = int((target - pos) / lot_size) * lot_size
 
@@ -5026,16 +5130,20 @@ class TurtleUsHkStrategy(StrategyTemplate):
             # 该标的会被永久冻结在「以为持有」的状态（回测尤其致命）。
             signal = getattr(self, "signals", {}).get(vt_symbol)
             machine = getattr(signal, "machine", None)
-            if target == 0 and pos == 0 and machine is not None and machine.target:
-                desired: int = int(self.targets[vt_symbol])
-                machine.target = 0
-                self._log_throttled(
-                    f"no_open_{vt_symbol}",
-                    f"[信号] {vt_symbol} 目标 {desired} 股（每手 {lot_size} 股，"
-                    f"一手约 {price * lot_size:,.0f}），按预算/权重/资金裁剪后为 0 股，"
-                    "本轮不建仓；状态机已回退空仓，下一交易日重算通道",
-                    3600,
+            desired: int = int(self.targets[vt_symbol])
+            had_level: bool = bool(machine is not None and machine.target)
+
+            # P0 诊断：先记录（此时级别仍在），再回退状态机（不改变交易行为）
+            bar_dt = getattr(bar, "datetime", None)
+            day: date = bar_dt.date() if isinstance(bar_dt, datetime) else self._today()
+            if diff == 0 and pos == 0 and (desired or had_level):
+                reason: str = veto or ("unit_zero" if not desired else "lot_rounding")
+                self._record_signal_blocked(
+                    vt_symbol, day, price, desired, target, pos, reason
                 )
+
+            if target == 0 and pos == 0 and had_level:
+                machine.target = 0
 
             # 排名分：做多按偏离度降序（越强越优先）；
             # 做空按「接近 MA60」排序（刚跌破的优先，与候选筛选保持一致）
@@ -5046,11 +5154,14 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 "vt_symbol": vt_symbol,
                 "pos": pos,
                 "target": target,
+                "desired": desired,
                 "price": price,
+                "day": day,
                 "lot": lot_size,
                 "diff": diff,
                 "is_open": is_open,
                 "rank": rank_score,
+                "veto": veto,
             })
 
         # 阶段二：账户级总敞口 + 可用资金 / 当日亏损门禁。
