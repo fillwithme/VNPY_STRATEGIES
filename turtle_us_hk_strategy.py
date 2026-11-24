@@ -410,6 +410,9 @@ class TurtleUsHkStrategy(StrategyTemplate):
     use_er_filter: bool = False          # 是否启用 ER 开仓过滤
     er_window: int = 20                  # ER 回看交易日数
     er_threshold: float = 0.30           # ER 低于此值视为震荡，不开新仓
+    # 条件放宽：广度 >= breadth_strong（强趋势）时改用更低的 ER 阈值；0=不启用
+    # 需要 use_trend_filter=true 才有市场广度；用于「趋势市放宽、震荡市收紧」。
+    er_threshold_strong: float = 0.0
     # P1-6 风险预算恒定（默认不启用）：持仓数越少、单只预算越大
     use_risk_budget: bool = False        # 是否启用动态单只仓位（基准数 / 当前持仓上限）
     risk_budget_base: int = 10           # 基准持仓数，通常等于股票池大小
@@ -590,6 +593,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
         "use_er_filter",
         "er_window",
         "er_threshold",
+        "er_threshold_strong",
         # P1-6 风险预算恒定
         "use_risk_budget",
         "risk_budget_base",
@@ -1221,6 +1225,19 @@ class TurtleUsHkStrategy(StrategyTemplate):
         stamps[key] = now
         self.write_log(msg)
         return True
+
+    def _er_threshold_now(self) -> float:
+        """当前生效的 ER 阈值：强广度时放宽到 er_threshold_strong。
+
+        需要 use_trend_filter=true 才有市场广度；关闭趋势过滤时该参数不生效。
+        """
+        if (
+            self.er_threshold_strong > 0
+            and self.use_trend_filter
+            and self.market_breadth >= self.breadth_strong
+        ):
+            return self.er_threshold_strong
+        return self.er_threshold
 
     def _record_signal_blocked(
         self,
@@ -5046,7 +5063,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
                         if er_now < threshold:
                             target = pos
                             veto = "er_percentile"
-                elif er_now < self.er_threshold:
+                elif er_now < self._er_threshold_now():
                     target = pos
                     veto = "er_threshold"
 
