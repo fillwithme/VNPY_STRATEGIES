@@ -468,6 +468,9 @@ class TurtleUsHkStrategy(StrategyTemplate):
     #                                      适合确认过券商持仓、准备重新对齐时使用
     check_positions_on_start: bool = True
     sync_positions_from_broker: bool = False
+    # 启动期条件自动同步：仅在「券商=0、策略≠0、无活动委托/隔离委托/未确认意图」
+    # 时自动清理幽灵持仓；盘中不一致仍然锁定，需人工处理。
+    auto_sync_positions_on_start: bool = False
 
     # 临时禁止新委托（默认关闭）：用于「同步持仓后先观察指标」的过渡期。
     # 打开时策略仍接收行情、更新净值/心跳，但不会发送任何新委托。
@@ -637,6 +640,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # 实盘启动持仓校验
         "check_positions_on_start",
         "sync_positions_from_broker",
+        "auto_sync_positions_on_start",
         "block_new_orders",
         "close_only",
         "max_order_cash_ratio",
@@ -1630,14 +1634,99 @@ class TurtleUsHkStrategy(StrategyTemplate):
             self.write_log("[对账] 已切换 close_only；请人工核对后重启，不自动补仓")
             self._save_state_throttled(force=True)
 
+    def _ib_api_ready_for_start_sync(self) -> bool:
+        """启动同步前确认 IB 会话可用；测试环境无 gateway 时跳过该检查。"""
+        engine = getattr(self, "strategy_engine", None)
+        main_engine = getattr(engine, "main_engine", None)
+        get_gateway = getattr(main_engine, "get_gateway", None)
+        if get_gateway is None:
+            return True
+        try:
+            gateway = get_gateway("IB")
+        except Exception:
+            return False
+        if gateway is None:
+            return False
+        api = getattr(gateway, "api", None)
+        if api is None:
+            return False
+        return bool(getattr(api, "status", False))
+
+    def _has_pending_start_orders(self) -> bool:
+        if getattr(self, "active_orderids", None):
+            return True
+        if getattr(self, "quarantine_orderids", None):
+            return True
+        for intent in (getattr(self, "order_ledger", None) or {}).values():
+            if (
+                intent.get("status") not in _TERMINAL_INTENT_STATUSES
+                and int(intent.get("remaining", 0) or 0) > 0
+            ):
+                return True
+        return False
+
+    def _can_auto_sync_ghost_positions(
+        self, mismatches: List[tuple[str, int, int]]
+    ) -> bool:
+        """只允许自动清理「券商=0、策略≠0」的幽灵持仓。
+
+        有活动委托/隔离委托/未确认意图、断线恢复中、IB 未连接时一律拒绝；
+        盘中不一致不走这里，仍由周期对账锁定。
+        """
+        if not getattr(self, "auto_sync_positions_on_start", False):
+            return False
+        if not mismatches:
+            return False
+        if getattr(self, "_disconnect_block", False):
+            return False
+        if getattr(self, "_recovery_pending", False):
+            return False
+        if self._has_pending_start_orders():
+            return False
+        if not self._ib_api_ready_for_start_sync():
+            return False
+        return all(
+            broker_volume == 0 and strategy_volume != 0
+            for _, strategy_volume, broker_volume in mismatches
+        )
+
+    def _apply_broker_positions_on_start(
+        self,
+        broker: Dict[str, int],
+        broker_count: int,
+        *,
+        auto: bool,
+    ) -> None:
+        auto_details = ", ".join(
+            f"{symbol}: {int(self.get_pos(symbol))}→0"
+            for symbol in self.vt_symbols
+            if int(self.get_pos(symbol)) != 0 and broker.get(symbol, 0) == 0
+        )
+        self.cost_basis.clear()
+        for vt_symbol in self.vt_symbols:
+            volume = broker.get(vt_symbol, 0)
+            self.pos_data[vt_symbol] = volume
+            self.targets[vt_symbol] = self.targets.get(vt_symbol, 0)
+
+        self._positions_verified = True
+        self._trading_blocked = False
+        self._positions_mismatch_logged = False
+        if auto:
+            message = (
+                f"[对账] 已自动清理幽灵持仓（{auto_details or '无'}）；"
+                f"券商非零标的 {broker_count} 个"
+            )
+            self.write_log(message)
+            self._alert("WARN", "auto_sync_positions", message)
+        else:
+            self.write_log(
+                f"[对账] 已用券商持仓覆盖策略持仓（{broker_count} 个非零标的）"
+            )
+
     def _verify_positions_on_start(self) -> None:
-        """启动时比对策略持仓与券商持仓
+        """启动时比对策略持仓与券商持仓。
 
-        不一致时的处理：
-          · sync_positions_from_broker=True  -> 以券商为准覆盖 pos_data
-          · 否则                              -> 禁止下单（send_orders 直接返回）
-
-        这样即使 state / portfolio_strategy_data 损坏，也不会继续发错单。
+        顺序：先算差异 → 显式 sync → 条件自动同步幽灵持仓 → 一致放行/不一致锁定。
         """
         if not self.check_positions_on_start:
             self._positions_verified = True
@@ -1647,21 +1736,6 @@ class TurtleUsHkStrategy(StrategyTemplate):
         broker: Dict[str, int] = self._broker_net_positions()
         broker_count: int = sum(1 for v in broker.values() if v)
 
-        if self.sync_positions_from_broker:
-            self.cost_basis.clear()
-
-            for vt_symbol in self.vt_symbols:
-                volume = broker.get(vt_symbol, 0)
-                self.pos_data[vt_symbol] = volume
-                self.targets[vt_symbol] = self.targets.get(vt_symbol, 0)
-
-            self._positions_verified = True
-            self._trading_blocked = False
-            self.write_log(
-                f"[对账] 已用券商持仓覆盖策略持仓（{broker_count} 个非零标的）"
-            )
-            return
-
         mismatches: List[tuple[str, int, int]] = []
         for vt_symbol in self.vt_symbols:
             strategy_volume = int(self.get_pos(vt_symbol))
@@ -1669,10 +1743,18 @@ class TurtleUsHkStrategy(StrategyTemplate):
             if strategy_volume != broker_volume:
                 mismatches.append((vt_symbol, strategy_volume, broker_volume))
 
+        if self.sync_positions_from_broker:
+            self._apply_broker_positions_on_start(broker, broker_count, auto=False)
+            return
+
         if not mismatches:
             self._positions_verified = True
             self._trading_blocked = False
             self.write_log(f"[对账] 策略持仓与券商一致（{broker_count} 个非零标的）")
+            return
+
+        if self._can_auto_sync_ghost_positions(mismatches):
+            self._apply_broker_positions_on_start(broker, broker_count, auto=True)
             return
 
         self._positions_verified = False
@@ -1688,8 +1770,9 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 f"[对账]   {vt_symbol}: 策略={strategy_volume}，券商={broker_volume}"
             )
         self.write_log(
-            "[对账] 处理方式：核对券商持仓后，在配置中设置 "
-            "sync_positions_from_broker=true 重启一次，或修正状态文件"
+            "[对账] 处理方式：核对券商持仓后，开启 "
+            "sync_positions_from_broker 重启一次，或启用启动期 "
+            "auto_sync_positions_on_start 自动清理幽灵持仓"
         )
 
     def _maybe_reconcile_target_state(self) -> None:
