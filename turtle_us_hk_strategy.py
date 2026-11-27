@@ -543,6 +543,18 @@ class TurtleUsHkStrategy(StrategyTemplate):
     # 由 scripts/pit_universe.py 生成，用于量化选股/幸存者偏差（S4-02）。
     universe_file: str = ""
 
+    # ---- 离场质量（默认全部关闭，保证基线配置可逐字复现；仅多头）----
+    # 盈利保护：持仓最高价达到「参考成本 + trigger×N」后，次日起止损上移到
+    # 「参考成本 + offset×N」，只升不降；参考成本=各级触发价等权平均，不依赖券商成本。
+    # 0=不启用。研究结论见 README_OPTIMIZE_PLAN.md（离场质量），上线前须完成回测与 Paper 对拍。
+    profit_lock_trigger_n: float = 0.0
+    profit_lock_offset_n: float = 1.0
+    # 开盘跳空穿越止损：off 不干预；log 只在离场记录里标注；
+    # delay 延后 gap_exit_delay_minutes 分钟再离场，期间跌破「止损 − panic_n×N」仍立即离场。
+    gap_exit_mode: str = "off"
+    gap_exit_delay_minutes: int = 30
+    gap_exit_panic_n: float = 1.5
+
     # 名称列表
     parameters = [
         "entry_window",
@@ -677,7 +689,13 @@ class TurtleUsHkStrategy(StrategyTemplate):
         "alert_drawdown",
         "emergency_flatten_file",
         "legacy_symbols",
-        "universe_file"
+        "universe_file",
+        # 离场质量（默认关闭）
+        "profit_lock_trigger_n",
+        "profit_lock_offset_n",
+        "gap_exit_mode",
+        "gap_exit_delay_minutes",
+        "gap_exit_panic_n",
     ]
 
     # 不只是显示：variables 会进入引擎的 portfolio_strategy_data.json。
@@ -746,6 +764,11 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 max_bars=self.max_bars,
                 min_bars=self.min_bars,
                 short_stop_mult=self.short_stop_mult,
+                profit_lock_trigger_n=self.profit_lock_trigger_n,
+                profit_lock_offset_n=self.profit_lock_offset_n,
+                gap_exit_mode=self.gap_exit_mode,
+                gap_exit_delay_minutes=self.gap_exit_delay_minutes,
+                gap_exit_panic_n=self.gap_exit_panic_n,
             )
 
             self.signals[vt_symbol] = TurtleSignal(
@@ -760,6 +783,9 @@ class TurtleUsHkStrategy(StrategyTemplate):
 
         # 初始化目标字典
         self.targets: Dict[str, int] = {}
+
+        # 离场事件日志：状态机每次决定离场时追加（回测与实盘共用，回测结束由 backtest_generic 导出）
+        self.exit_log: List[dict] = []
 
         # 初始化组合K线生成器（tick -> 分钟截面 -> 盘中日K截面）
         # 使用按标的独立收 bar 的版本，避免一个标的换分钟把其他标的
@@ -2371,6 +2397,9 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 "traded": bool(machine.traded),
                 "rebase_next_add": bool(getattr(machine, "rebase_next_add", False)),
             }
+            if getattr(machine, "profit_lock_trigger_n", 0.0) > 0:
+                data[vt_symbol]["hold_high"] = float(machine.hold_high)
+                data[vt_symbol]["lock_stop"] = float(machine.lock_stop)
             if self.use_corporate_actions:
                 anchor = self._state_dict("_ca_dates").get(vt_symbol)
                 data[vt_symbol]["price_anchor"] = anchor.isoformat() if anchor else None
@@ -2520,6 +2549,9 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 machine.entry_down = float(fields.get("entry_down", 0.0))
                 machine.exit_up = float(fields.get("exit_up", 0.0))
                 machine.exit_down = float(fields.get("exit_down", 0.0))
+                if getattr(machine, "profit_lock_trigger_n", 0.0) > 0:
+                    machine.hold_high = float(fields.get("hold_high", 0.0) or 0.0)
+                    machine.lock_stop = float(fields.get("lock_stop", 0.0) or 0.0)
                 self._restore_corporate_action_state(vt_symbol, fields, meta)
                 self._state_set("_restored_held").add(vt_symbol)
             elif saved_target != 0:
@@ -3001,6 +3033,8 @@ class TurtleUsHkStrategy(StrategyTemplate):
             "cancel_requested": False,
             "seen_broker": False,
         }
+        if plan.get("exit"):
+            intent["exit"] = dict(plan["exit"])
         self.order_ledger[intent_id] = intent
         self._symbol_active_intent[plan["vt_symbol"]] = intent_id
         return intent
@@ -3081,8 +3115,10 @@ class TurtleUsHkStrategy(StrategyTemplate):
             "machine": {
                 k: getattr(machine, k, None)
                 for k in ("target", "n", "entry_up", "entry_down", "long_entry",
-                          "short_entry", "exit_up", "exit_down", "cci", "traded")
+                          "short_entry", "exit_up", "exit_down", "cci", "traded",
+                          "hold_high", "lock_stop")
             } if machine is not None else {},
+            "exit": intent.get("exit"),
             "unit": getattr(signal, "unit", None),
             "context": {
                 "account_balance": self.account_balance,
@@ -4146,6 +4182,8 @@ class TurtleUsHkStrategy(StrategyTemplate):
             signal: TurtleSignal = self.signals[vt_symbol]
             signal.on_bar(bar)
             self.targets[vt_symbol] = signal.get_target()
+            if getattr(signal.machine, "exit_events", None):
+                self._collect_exit_events(vt_symbol, signal.machine)
 
             # 换池过渡期：遗留标的只允许减仓/平仓，禁止加仓或开新仓
             if vt_symbol in self.legacy_symbols:
@@ -4153,6 +4191,37 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 if abs(self.targets[vt_symbol]) > abs(pos):
                     self.targets[vt_symbol] = pos
 
+    def _collect_exit_events(self, vt_symbol: str, machine: Any) -> None:
+        """取走状态机的离场事件：补上标的与持仓后追加到 exit_log（纯记录，不影响交易）。"""
+        events: list = list(machine.exit_events)
+        machine.exit_events.clear()
+        pos: int = int(self.get_pos(vt_symbol))
+        for event in events:
+            record: dict = {"vt_symbol": vt_symbol, "pos": pos, **event}
+            self.exit_log.append(record)
+            if self.live_mode:
+                self.write_log(
+                    f"[离场] {vt_symbol} 原因={record['reason']}"
+                    f"{'（开盘跳空）' if record.get('gap') else ''} "
+                    f"止损={record['stop']:.3f}（2N={record['stop_2n']:.3f} "
+                    f"通道={record['channel']:.3f} 保护={record['lock']:.3f}）"
+                    f" N={record['n']:.3f} 持仓最高={record['hold_high']:.3f}"
+                )
+        if len(self.exit_log) > 5000:
+            del self.exit_log[:len(self.exit_log) - 5000]
+
+    def _exit_info_for(self, vt_symbol: str, bar: BarData, pos: int, diff: int) -> dict | None:
+        """本次减仓/平仓对应的状态机离场事件：仅当状态机已决定离场且事件发生在同一交易日。"""
+        if diff >= 0 or pos <= 0:
+            return None
+        signal = (self.__dict__.get("signals") or {}).get(vt_symbol)
+        machine = getattr(signal, "machine", None)
+        event = getattr(machine, "last_exit", None)
+        if not event or machine.target != 0:
+            return None
+        if str(event.get("time") or "")[:10] != bar.datetime.date().isoformat():
+            return None
+        return event
     # ------------------------------------------------------------------
     # 组合层风控（P0-1 / P0-2 / P1-1）
     # 原则：只削减「实际下单量」，不回写状态机 target；平仓/减仓永不受限
@@ -4535,6 +4604,12 @@ class TurtleUsHkStrategy(StrategyTemplate):
         machine = (
             self.signals[vt_symbol].machine if vt_symbol in self.signals else None
         )
+        exit_reason: str = ""
+        if sign < 0:
+            intent_id = (getattr(self, "_orderid_intent", None) or {}).get(trade.vt_orderid)
+            exit_info = ((getattr(self, "order_ledger", None) or {}).get(intent_id) or {}).get("exit") or {}
+            if exit_info:
+                exit_reason = str(exit_info.get("reason", "")) + ("+gap" if exit_info.get("gap") else "")
         self.fill_records.append(
             {
                 "datetime": trade.datetime,
@@ -4548,6 +4623,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 "er": round(self.er_values.get(vt_symbol, 0.0), 4),
                 "breadth": round(self.market_breadth, 4),
                 "target_level": int(machine.target) if machine else 0,
+                "exit_reason": exit_reason,
                 "note": "",
                 "emotion": "",
             }
@@ -4583,6 +4659,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
                     "er",
                     "breadth",
                     "target_level",
+                    "exit_reason",
                     "note",
                     "emotion",
                 ],
@@ -5262,6 +5339,7 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 "is_open": is_open,
                 "rank": rank_score,
                 "veto": veto,
+                "exit": self._exit_info_for(vt_symbol, bar, pos, diff),
             })
 
         # 阶段二：账户级总敞口 + 可用资金 / 当日亏损门禁。
