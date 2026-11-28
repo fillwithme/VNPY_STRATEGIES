@@ -549,6 +549,14 @@ class TurtleUsHkStrategy(StrategyTemplate):
     # 0=不启用。研究结论见 README_OPTIMIZE_PLAN.md（离场质量），上线前须完成回测与 Paper 对拍。
     profit_lock_trigger_n: float = 0.0
     profit_lock_offset_n: float = 1.0
+    close_confirm_mode: str = "off"
+    close_confirm_disaster_n: float = 1.0
+    initial_stop_n: float = 0.0
+    initial_stop_until_mfe_n: float = 1.0
+    fail_breakout_days: int = 0
+    fail_breakout_offset_n: float = 0.0
+    time_stop_days: int = 0
+    time_stop_min_mfe_n: float = 1.0
     # 开盘跳空穿越止损：off 不干预；log 只在离场记录里标注；
     # delay 延后 gap_exit_delay_minutes 分钟再离场，期间跌破「止损 − panic_n×N」仍立即离场。
     gap_exit_mode: str = "off"
@@ -693,6 +701,14 @@ class TurtleUsHkStrategy(StrategyTemplate):
         # 离场质量（默认关闭）
         "profit_lock_trigger_n",
         "profit_lock_offset_n",
+        "close_confirm_mode",
+        "close_confirm_disaster_n",
+        "initial_stop_n",
+        "initial_stop_until_mfe_n",
+        "fail_breakout_days",
+        "fail_breakout_offset_n",
+        "time_stop_days",
+        "time_stop_min_mfe_n",
         "gap_exit_mode",
         "gap_exit_delay_minutes",
         "gap_exit_panic_n",
@@ -766,6 +782,14 @@ class TurtleUsHkStrategy(StrategyTemplate):
                 short_stop_mult=self.short_stop_mult,
                 profit_lock_trigger_n=self.profit_lock_trigger_n,
                 profit_lock_offset_n=self.profit_lock_offset_n,
+                close_confirm_mode=self.close_confirm_mode,
+                close_confirm_disaster_n=self.close_confirm_disaster_n,
+                initial_stop_n=self.initial_stop_n,
+                initial_stop_until_mfe_n=self.initial_stop_until_mfe_n,
+                fail_breakout_days=self.fail_breakout_days,
+                fail_breakout_offset_n=self.fail_breakout_offset_n,
+                time_stop_days=self.time_stop_days,
+                time_stop_min_mfe_n=self.time_stop_min_mfe_n,
                 gap_exit_mode=self.gap_exit_mode,
                 gap_exit_delay_minutes=self.gap_exit_delay_minutes,
                 gap_exit_panic_n=self.gap_exit_panic_n,
